@@ -28,7 +28,7 @@ mod dmabuf;
 #[cfg(target_os = "linux")]
 mod gl;
 
-pub use embed::{Embed, Frame, GlEmbed, GlFrame, Link, ProcAddress};
+pub use embed::{Embed, Frame, GlEmbed, GlFrame, Input, Link, ProcAddress};
 pub use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,11 +46,14 @@ pub struct WindowOptions {
     pub app_id: Option<String>,
     /// What's under the page and its embeds: red, green, blue, alpha (0 to 1; under 1: a see-through window).
     pub background: [f64; 4],
+    /// The page in a window of its own, drawn and shown by Chromium: no compositing (no extra
+    /// frame of latency), no embeds. For pages that are all there is: a game in WebGPU, an app's UI.
+    pub direct: bool,
 }
 
 impl WindowOptions {
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> WindowOptions {
-        WindowOptions { id: id.into(), url: url.into(), title: None, width: 1280, height: 800, app_id: None, background: [0.0, 0.0, 0.0, 1.0] }
+        WindowOptions { id: id.into(), url: url.into(), title: None, width: 1280, height: 800, app_id: None, background: [0.0, 0.0, 0.0, 1.0], direct: false }
     }
 }
 

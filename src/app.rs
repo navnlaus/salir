@@ -14,10 +14,10 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// SALIR_TRACE=1: what salir does, on stderr.
 macro_rules! trace {
@@ -34,6 +34,7 @@ pub enum Event {
     Pump,
     EmbedSend { window: u64, embed: u64, message: Value },
     EmbedFrame { window: u64, embed: u64 },
+    EmbedRelease { window: u64, embed: u64 },
     Control(Command),
     ControlClosed,
 }
@@ -43,6 +44,9 @@ static PUMP_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static PUMPED: Mutex<Option<Instant>> = Mutex::new(None); // (last done)
 static PROXY: OnceLock<Mutex<EventLoopProxy<Event>>> = OnceLock::new();
 const PUMP_AT_LEAST: Duration = Duration::from_millis(33); // (CEF's advice: every 1/30 s at the longest)
+// With a direct window open: often. (Its input comes to Chromium, from its own window, only as
+// its work is done; CEF doesn't ask for that.)
+const PUMP_DIRECT: Duration = Duration::from_millis(4);
 
 pub fn schedule_pump(delay_ms: i64) {
     let at = Instant::now() + Duration::from_millis(delay_ms.max(0) as u64);
@@ -138,7 +142,7 @@ struct App {
 struct Win {
     key: u64,
     id: String,
-    surface: Surface,
+    surface: Option<Surface>, // (None: a direct window, CEF's own)
     page: Option<Page>,
     shared: Shared,
     embeds: Vec<EmbedLayer>,
@@ -151,6 +155,62 @@ struct Win {
     modifiers: ModifiersState,
     last_click: Option<(Instant, u8, (f64, f64), i32)>,
     closing: bool,
+    /// The embed the window's input goes to directly (input="direct"), and whether the pointer's locked.
+    capture: Option<(u64, bool)>,
+    focused: bool,
+}
+
+impl Win {
+    fn window(&self) -> Option<&Arc<Window>> {
+        self.surface.as_ref().map(|s| &s.window)
+    }
+
+    fn redraw(&self) {
+        if let Some(w) = self.window() {
+            w.request_redraw();
+        }
+    }
+
+    // The pointer locked and hidden (FPS-style; else just kept in the window), or let go.
+    fn grab(&self, lock: bool) {
+        let Some(w) = self.window() else { return };
+        if lock {
+            if w.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                let _ = w.set_cursor_grab(CursorGrabMode::Confined);
+            }
+            w.set_cursor_visible(false);
+        } else {
+            let _ = w.set_cursor_grab(CursorGrabMode::None);
+            w.set_cursor_visible(true);
+        }
+    }
+
+    // The input-capturing embed's place (CSS pixels): where its input's coordinates start.
+    fn capture_origin(&self) -> (f32, f32) {
+        self.capture.and_then(|(id, _)| self.embeds.iter().find(|e| e.id == id)).and_then(|e| e.rect).map_or((0.0, 0.0), |r| (r[0], r[1]))
+    }
+
+    fn capture_input(&mut self, input: &crate::Input) {
+        let Some((id, _)) = self.capture else { return };
+        if let Some(e) = self.embeds.iter_mut().find(|e| e.id == id) {
+            match &mut e.imp {
+                Imp::Wgpu { embed, .. } => embed.input(input),
+                #[cfg(target_os = "linux")]
+                Imp::Gl { embed, .. } => embed.input(input),
+            }
+        }
+    }
+
+    // The input back to the page; `tell`: the page told (it didn't ask).
+    fn release(&mut self, tell: bool) {
+        let Some((id, lock)) = self.capture.take() else { return };
+        if lock {
+            self.grab(false);
+        }
+        if tell && let Some(page) = &self.page {
+            page.deliver(&json!({ "$": "embed.released", "id": id }));
+        }
+    }
 }
 
 struct EmbedLayer {
@@ -175,29 +235,39 @@ impl App {
         if self.windows.values().any(|w| w.id == options.id) {
             return self.report(&format!("a window {} is open already", options.id));
         }
-        let mut attributes = Window::default_attributes().with_title(options.title.clone().unwrap_or_else(|| "salir".into())).with_inner_size(winit::dpi::LogicalSize::new(options.width, options.height)).with_transparent(options.background[3] < 1.0);
-        #[cfg(target_os = "linux")]
-        if let Some(app_id) = &options.app_id {
-            use winit::platform::wayland::WindowAttributesExtWayland;
-            attributes = WindowAttributesExtWayland::with_name(attributes, app_id, "");
-        }
-        let window = match event_loop.create_window(attributes) {
-            Ok(w) => Arc::new(w),
-            Err(e) => return self.report(&format!("window {}: {e}", options.id)),
+        let [r, g, b, a] = options.background;
+        let (surface, shared, page) = if options.direct {
+            // CEF's own window: Chromium draws and shows it (no wgpu, no embeds).
+            let shared = Shared { state: Rc::new(RefCell::new(PageState { size: (options.width as i32, options.height as i32), scale: 1.0, ..Default::default() })), gpu: self.gpu.clone() };
+            let argb = (((a * 255.0) as u32) << 24) | (((r * 255.0) as u32) << 16) | (((g * 255.0) as u32) << 8) | ((b * 255.0) as u32);
+            let direct = browser::DirectWindow { title: options.title.clone(), width: options.width as i32, height: options.height as i32, app_id: options.app_id.clone() };
+            let page = Page::open(&shared, &options.url, Some(direct), argb);
+            (None, shared, page)
+        } else {
+            let mut attributes = Window::default_attributes().with_title(options.title.clone().unwrap_or_else(|| "salir".into())).with_inner_size(winit::dpi::LogicalSize::new(options.width, options.height)).with_transparent(a < 1.0);
+            #[cfg(target_os = "linux")]
+            if let Some(app_id) = &options.app_id {
+                use winit::platform::wayland::WindowAttributesExtWayland;
+                attributes = WindowAttributesExtWayland::with_name(attributes, app_id, "");
+            }
+            let window = match event_loop.create_window(attributes) {
+                Ok(w) => Arc::new(w),
+                Err(e) => return self.report(&format!("window {}: {e}", options.id)),
+            };
+            let size = window.inner_size();
+            let surface = match self.gpu.surface(window.clone(), size.width, size.height) {
+                Ok(s) => s,
+                Err(e) => return self.report(&format!("window {}: {e}", options.id)),
+            };
+            let scale = window.scale_factor();
+            let logical = size.to_logical::<f64>(scale);
+            let shared = Shared { state: Rc::new(RefCell::new(PageState { size: (logical.width as i32, logical.height as i32), scale: scale as f32, ..Default::default() })), gpu: self.gpu.clone() };
+            let page = Page::open(&shared, &options.url, None, 0);
+            (Some(surface), shared, page)
         };
-        let size = window.inner_size();
-        let surface = match self.gpu.surface(window.clone(), size.width, size.height) {
-            Ok(s) => s,
-            Err(e) => return self.report(&format!("window {}: {e}", options.id)),
-        };
-        let scale = window.scale_factor();
-        let logical = size.to_logical::<f64>(scale);
-        let shared = Shared { state: Rc::new(RefCell::new(PageState { size: (logical.width as i32, logical.height as i32), scale: scale as f32, ..Default::default() })), gpu: self.gpu.clone() };
-        let page = Page::open(&shared, &options.url);
         if page.is_none() {
             return self.report(&format!("window {}: no page", options.id));
         }
-        let [r, g, b, a] = options.background;
         let key = self.next_key;
         self.next_key += 1;
         self.windows.insert(
@@ -216,9 +286,11 @@ impl App {
                 modifiers: ModifiersState::empty(),
                 last_click: None,
                 closing: false,
+                capture: None,
+                focused: true,
             },
         );
-        trace!("window {} opened ({}×{} px, ×{scale}): {}", options.id, size.width, size.height, options.url);
+        trace!("window {} opened{}: {}", options.id, if options.direct { " (direct)" } else { "" }, options.url);
         if self.control {
             control::emit(json!({ "opened": options.id }));
         }
@@ -272,13 +344,22 @@ impl App {
                 (std::mem::take(&mut s.messages), s.title.take(), s.cursor.take(), std::mem::take(&mut s.popups), std::mem::replace(&mut s.painted, false), s.closed, s.error.take())
             };
             if let Some(title) = title.filter(|_| !w.fixed_title) {
-                w.surface.window.set_title(&title);
+                match w.window() {
+                    Some(window) => window.set_title(&title),
+                    None => {
+                        if let Some(page) = &w.page {
+                            page.set_title(&title);
+                        }
+                    }
+                }
             }
-            if let Some(cursor) = cursor {
-                w.surface.window.set_cursor(cursor);
+            if let (Some(cursor), Some(window)) = (cursor, w.window())
+                && w.capture.is_none_or(|(_, lock)| !lock)
+            {
+                window.set_cursor(cursor); // (not while it's locked and hidden)
             }
             if painted {
-                w.surface.window.request_redraw();
+                w.redraw();
             }
             let id = w.id.clone();
             if let Some(e) = error {
@@ -315,6 +396,7 @@ impl App {
             "hello" => {
                 // A new page: the last one's embeds are gone with it.
                 if let Some(mut w) = self.windows.remove(&key) {
+                    w.release(false);
                     self.drop_embeds(&mut w, |_| true);
                     self.windows.insert(key, w);
                 }
@@ -343,7 +425,7 @@ impl App {
                     && let Some(e) = w.embeds.iter_mut().find(|e| e.id == id)
                 {
                     e.rect = m.get("rect").and_then(|r| serde_json::from_value(r.clone()).ok());
-                    w.surface.window.request_redraw();
+                    w.redraw();
                 }
             }
             "embed.message" => {
@@ -359,9 +441,33 @@ impl App {
             }
             "embed.remove" => {
                 if let Some(mut w) = self.windows.remove(&key) {
+                    if w.capture.is_some_and(|(c, _)| c == id) {
+                        w.release(false);
+                    }
                     self.drop_embeds(&mut w, |e| e.id == id);
-                    w.surface.window.request_redraw();
+                    w.redraw();
                     self.windows.insert(key, w);
+                }
+            }
+            "embed.input" => {
+                // input="direct" (lock: the pointer locked too) set on an embed, or not any more.
+                if let Some(w) = self.windows.get_mut(&key) {
+                    let direct = m.get("mode").and_then(Value::as_str) == Some("direct");
+                    let lock = m.get("lock").and_then(Value::as_bool).unwrap_or(false);
+                    if direct && w.surface.is_some() && w.embeds.iter().any(|e| e.id == id) {
+                        if w.capture.is_some_and(|(c, _)| c != id) {
+                            w.release(true); // (another had it)
+                        }
+                        let was_locked = w.capture.is_some_and(|(_, l)| l);
+                        w.capture = Some((id, lock));
+                        if lock != was_locked && w.focused {
+                            w.grab(lock);
+                        }
+                        trace!("window {}: input to embed {id} directly{}", w.id, if lock { ", the pointer locked" } else { "" });
+                    } else if w.capture.is_some_and(|(c, _)| c == id) {
+                        w.release(false);
+                        trace!("window {}: input to the page again", w.id);
+                    }
                 }
             }
             _ => {}
@@ -437,7 +543,8 @@ impl App {
         };
         let gpu = self.gpu.clone();
         let Some(w) = self.windows.get_mut(&key) else { return };
-        let (ww, wh) = (w.surface.config.width, w.surface.config.height);
+        let Some(surface) = &w.surface else { return };
+        let (ww, wh) = (surface.config.width, surface.config.height);
         let scale = w.shared.state.borrow().scale;
         for e in &mut w.embeds {
             let px = e.rect.map(|[x, y, rw, rh]| [x * scale, y * scale, rw * scale, rh * scale]);
@@ -528,7 +635,9 @@ impl App {
         }
         layers.extend(state.page.as_ref().map(|(_, l)| l));
         layers.extend(state.popup.as_ref().map(|(_, l)| l));
-        gpu.compose(&w.surface, w.background, &layers);
+        if let Some(surface) = &w.surface {
+            gpu.compose(surface, w.background, &layers);
+        }
     }
 }
 
@@ -541,6 +650,58 @@ fn close(w: &mut Win) {
         Some(page) => page.close(),
         None => w.shared.state.borrow_mut().closed = true,
     }
+}
+
+// A window event as an embed's direct input (it has the window's input: input="direct").
+// True: it was input, and the embed's (not the page's).
+fn direct_input(w: &mut Win, event: &WindowEvent) -> bool {
+    use crate::Input;
+    let scale = w.window().map_or(1.0, |win| win.scale_factor());
+    let (ox, oy) = w.capture_origin();
+    let input = match event {
+        WindowEvent::CursorMoved { position, .. } => {
+            let p = position.to_logical::<f64>(scale);
+            w.cursor = (p.x, p.y);
+            Input::Move { x: p.x as f32 - ox, y: p.y as f32 - oy }
+        }
+        WindowEvent::MouseInput { state, button, .. } => {
+            let button = match button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                MouseButton::Back => 3,
+                MouseButton::Forward => 4,
+                MouseButton::Other(n) => (*n).min(255) as u8,
+            };
+            Input::Button { button, down: *state == ElementState::Pressed, x: w.cursor.0 as f32 - ox, y: w.cursor.1 as f32 - oy }
+        }
+        WindowEvent::MouseWheel { delta, .. } => match delta {
+            MouseScrollDelta::LineDelta(x, y) => Input::Wheel { dx: *x, dy: *y, lines: true },
+            MouseScrollDelta::PixelDelta(p) => {
+                let p = p.to_logical::<f64>(scale);
+                Input::Wheel { dx: p.x as f32, dy: p.y as f32, lines: false }
+            }
+        },
+        WindowEvent::KeyboardInput { event, .. } => {
+            let code = match event.physical_key {
+                winit::keyboard::PhysicalKey::Code(c) => format!("{c:?}"),
+                _ => String::new(),
+            };
+            let key = match &event.logical_key {
+                Key::Character(c) => c.to_string(),
+                Key::Named(n) => format!("{n:?}"),
+                _ => String::new(),
+            };
+            Input::Key { code, key, down: event.state == ElementState::Pressed, repeat: event.repeat, text: event.text.as_ref().map(|t| t.to_string()) }
+        }
+        WindowEvent::ModifiersChanged(m) => {
+            w.modifiers = m.state();
+            return false; // (the page's to know too, for when it has the input again)
+        }
+        _ => return false,
+    };
+    w.capture_input(&input);
+    true
 }
 
 fn modifier_flags(m: ModifiersState) -> u32 {
@@ -581,7 +742,14 @@ impl ApplicationHandler<Event> for App {
                     && let Some(e) = w.embeds.iter_mut().find(|e| e.id == embed)
                 {
                     e.wants_frame = true;
-                    w.surface.window.request_redraw();
+                    w.redraw();
+                }
+            }
+            Event::EmbedRelease { window, embed } => {
+                if let Some(w) = self.windows.get_mut(&window)
+                    && w.capture.is_some_and(|(c, _)| c == embed)
+                {
+                    w.release(true);
                 }
             }
             Event::Control(command) => self.command(event_loop, command),
@@ -590,19 +758,34 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Some(key) = self.windows.values().find(|w| w.surface.window.id() == id).map(|w| w.key) else { return };
+        let Some(key) = self.windows.values().find(|w| w.window().is_some_and(|win| win.id() == id)).map(|w| w.key) else { return };
         if let WindowEvent::RedrawRequested = event {
             return self.draw(key);
         }
         let gpu = self.gpu.clone();
         let Some(w) = self.windows.get_mut(&key) else { return };
+        if let WindowEvent::Focused(focused) = event {
+            w.focused = focused;
+            if let Some((_, lock)) = w.capture {
+                // (Locked only while it has the keyboard: elsewhere the pointer's the desktop's.)
+                if lock {
+                    w.grab(focused);
+                }
+                w.capture_input(&crate::Input::Focus(focused));
+            }
+        }
+        if w.capture.is_some() && direct_input(w, &event) {
+            return;
+        }
         let Some(page) = &w.page else { return };
-        let window = w.surface.window.clone();
+        let Some(window) = w.window().cloned() else { return };
         match event {
             WindowEvent::CloseRequested => close(w),
             WindowEvent::Resized(size) => {
                 trace!("window {} resized: {}×{} px", w.id, size.width, size.height);
-                w.surface.resize(&gpu, size.width, size.height);
+                if let Some(surface) = &mut w.surface {
+                    surface.resize(&gpu, size.width, size.height);
+                }
                 let logical = size.to_logical::<f64>(window.scale_factor());
                 {
                     let mut s = w.shared.state.borrow_mut();
@@ -677,12 +860,22 @@ impl ApplicationHandler<Event> for App {
         }
     }
 
+    // The mouse's own motion (raw): to an embed with the pointer locked, in the focused window.
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
+            && let Some(w) = self.windows.values_mut().find(|w| w.focused && w.capture.is_some_and(|(_, lock)| lock))
+        {
+            w.capture_input(&crate::Input::Motion { dx, dy });
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         // CEF's work: when it asked for it, and at least every 1/30 s whether it did or not.
         let asked = PUMP_AT.lock().unwrap().is_some_and(|at| at <= now);
         let last = *PUMPED.lock().unwrap();
-        if asked || last.is_none_or(|l| now - l >= PUMP_AT_LEAST) {
+        let interval = if self.windows.values().any(|w| w.surface.is_none()) { PUMP_DIRECT } else { PUMP_AT_LEAST };
+        if asked || last.is_none_or(|l| now - l >= interval) {
             *PUMP_AT.lock().unwrap() = None;
             *PUMPED.lock().unwrap() = Some(now);
             browser::work();
@@ -691,7 +884,7 @@ impl ApplicationHandler<Event> for App {
         if self.windows.is_empty() && (!self.control || self.quitting) && self.pending.is_empty() {
             return event_loop.exit();
         }
-        let next = PUMP_AT.lock().unwrap().unwrap_or(now + PUMP_AT_LEAST).min(PUMPED.lock().unwrap().unwrap_or(now) + PUMP_AT_LEAST);
+        let next = PUMP_AT.lock().unwrap().unwrap_or(now + interval).min(PUMPED.lock().unwrap().unwrap_or(now) + interval);
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 }

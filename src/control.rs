@@ -58,6 +58,7 @@ fn parse(v: &Value) -> Result<Command, String> {
         if let Some(n) = o.get("height").and_then(Value::as_u64) {
             w.height = n as u32;
         }
+        w.direct = o.get("direct").and_then(Value::as_bool).unwrap_or(false);
         if let Some(b) = o.get("background").and_then(|b| serde_json::from_value::<[f64; 4]>(b.clone()).ok()) {
             w.background = b;
         }

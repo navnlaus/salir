@@ -1,0 +1,144 @@
+<!doctype html>
+<!-- A game that's all Chromium: WebGPU in the page (particles, a compute shader),
+     its HUD in HTML. Best in a window of its own, no compositing:
+       salir --direct examples/webgpu/index.html
+     (in a composited window it works too: then salir copies nothing either, but
+     composes it). Mouse: left pulls, right pushes, wheel: how hard. Space: pause.
+     ?count=N, ?auto (pulled round by itself), ?frames=N (logs how fast N came). -->
+<meta charset="utf-8">
+<title>WebGPU in salir</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #030305; overflow: hidden; color: #cdd6e4; font: 13px system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #hud { position: fixed; left: 12px; top: 10px; background: rgb(10 12 18 / 0.7); border: 1px solid rgb(255 255 255 / 0.1); border-radius: 8px; padding: 6px 10px; }
+</style>
+<canvas></canvas>
+<div id="hud">–</div>
+<script type="module">
+  const COMMON = `struct Particle { pos: vec2f, vel: vec2f };
+struct Uniforms { mouse: vec2f, pull: f32, dt: f32, size: vec2f, aspect: f32, time: f32 };
+@group(0) @binding(0) var<uniform> u: Uniforms;
+`;
+  const STEP = COMMON + `@group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
+
+@compute @workgroup_size(256)
+fn step(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x;
+  if (i >= arrayLength(&particles)) { return; }
+  var p = particles[i];
+  // Toward the mouse (or away), in units that are the same both ways on screen.
+  var d = (u.mouse - p.pos) * vec2f(u.aspect, 1.0);
+  let r2 = dot(d, d) + 0.003;
+  var a = d * (u.pull / (r2 * sqrt(r2))) * 0.05;
+  // A slow swirl about the middle, so they're never still.
+  a += vec2f(-p.pos.y, p.pos.x * u.aspect) * 0.15;
+  p.vel = (p.vel + (a / vec2f(u.aspect, 1.0)) * u.dt) * exp(-0.9 * u.dt);
+  let speed = length(p.vel);
+  if (speed > 4.0) { p.vel *= 4.0 / speed; }
+  p.pos += p.vel * u.dt;
+  // Bounced off the edges.
+  if (abs(p.pos.x) > 1.0) { p.pos.x = clamp(p.pos.x, -1.0, 1.0); p.vel.x = -p.vel.x * 0.5; }
+  if (abs(p.pos.y) > 1.0) { p.pos.y = clamp(p.pos.y, -1.0, 1.0); p.vel.y = -p.vel.y * 0.5; }
+  particles[i] = p;
+}
+`;
+  const DRAW = COMMON + `@group(0) @binding(1) var<storage, read> particles: array<Particle>;
+
+struct Out { @builtin(position) pos: vec4f, @location(0) corner: vec2f, @location(1) color: vec3f };
+
+@vertex
+fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Out {
+  let corner = vec2f(f32(v & 1u), f32(v >> 1u)) * 2.0 - 1.0; // (a strip of 4)
+  let p = particles[i];
+  var out: Out;
+  out.pos = vec4f(p.pos + corner * u.size, 0.0, 1.0);
+  out.corner = corner;
+  let fast = clamp(length(p.vel) * 0.8, 0.0, 1.0);
+  out.color = mix(vec3f(0.10, 0.30, 1.0), vec3f(1.0, 0.50, 0.15), fast);
+  return out;
+}
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4f {
+  let a = max(0.0, 1.0 - dot(in.corner, in.corner));
+  return vec4f(in.color * a * 0.25, 1.0);
+}
+`;
+
+  const params = new URLSearchParams(location.search);
+  const auto = params.has("auto"), maxFrames = Number(params.get("frames")) || Infinity;
+  const canvas = document.querySelector("canvas"), hud = document.querySelector("#hud");
+  const say = (text) => ((hud.textContent = text), console.log(text));
+
+  const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) throw say("No WebGPU here");
+  const device = await adapter.requestDevice();
+  device.lost.then((i) => say(`GPU device lost: ${i.reason} ${i.message}`));
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  const context = canvas.getContext("webgpu");
+  context.configure({ device, format, alphaMode: "opaque" });
+  const gpuName = [adapter.info?.vendor, adapter.info?.architecture, adapter.info?.description].filter(Boolean).join(" ") || "GPU";
+
+  const uniforms = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const step = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: STEP }), entryPoint: "step" } });
+  const drawModule = device.createShaderModule({ code: DRAW });
+  const add = { srcFactor: "one", dstFactor: "one", operation: "add" };
+  const draw = device.createRenderPipeline({
+    layout: "auto",
+    vertex: { module: drawModule, entryPoint: "vs" },
+    fragment: { module: drawModule, entryPoint: "fs", targets: [{ format, blend: { color: add, alpha: add } }] },
+    primitive: { topology: "triangle-strip" },
+  });
+  const count = Number(params.get("count")) || 1 << 20;
+  const data = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    const r = Math.sqrt(Math.random()) * 0.9, t = Math.random() * Math.PI * 2;
+    data[i * 4] = Math.cos(t) * r, data[i * 4 + 1] = Math.sin(t) * r;
+  }
+  const particles = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(particles, 0, data);
+  const entries = [{ binding: 0, resource: { buffer: uniforms } }, { binding: 1, resource: { buffer: particles } }];
+  const stepGroup = device.createBindGroup({ layout: step.getBindGroupLayout(0), entries });
+  const drawGroup = device.createBindGroup({ layout: draw.getBindGroupLayout(0), entries });
+
+  let mouse = [0, 0], pull = 0, strength = 1, paused = false;
+  const toClip = (e) => [(e.clientX / innerWidth) * 2 - 1, 1 - (e.clientY / innerHeight) * 2];
+  canvas.onpointermove = (e) => (mouse = toClip(e));
+  canvas.onpointerdown = (e) => ((mouse = toClip(e)), (pull = e.button === 2 ? -1 : 1));
+  canvas.onpointerup = () => (pull = 0);
+  canvas.oncontextmenu = (e) => e.preventDefault();
+  canvas.onwheel = (e) => (strength = Math.min(8, Math.max(0.125, strength * (e.deltaY < 0 ? 1.25 : 0.8))));
+  addEventListener("keydown", (e) => {
+    if (e.key === " ") paused = !paused;
+  });
+
+  const start = performance.now(), times = [];
+  let last = start, shownAt = start, shown = 0;
+  requestAnimationFrame(function frame(now) {
+    const width = Math.round(canvas.clientWidth * devicePixelRatio), height = Math.round(canvas.clientHeight * devicePixelRatio);
+    if (canvas.width !== width || canvas.height !== height) Object.assign(canvas, { width, height });
+    times.push(now - last);
+    const dt = Math.min((now - last) / 1000, 1 / 30), time = (now - start) / 1000;
+    last = now;
+    const [m, p] = auto ? [[Math.cos(time * 0.7) * 0.6, Math.sin(time * 0.9) * 0.6], Math.sin(time * 0.5) > -0.3 ? 1 : -1] : [mouse, pull];
+    device.queue.writeBuffer(uniforms, 0, new Float32Array([m[0], m[1], p * strength, paused ? 0 : dt, 3 / width, 3 / height, width / height, time]));
+    const encoder = device.createCommandEncoder();
+    if (!paused) {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(step), pass.setBindGroup(0, stepGroup), pass.dispatchWorkgroups(Math.ceil(count / 256)), pass.end();
+    }
+    const pass = encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0.01, g: 0.01, b: 0.02, a: 1 }, loadOp: "clear", storeOp: "store" }] });
+    pass.setPipeline(draw), pass.setBindGroup(0, drawGroup), pass.draw(4, count), pass.end();
+    device.queue.submit([encoder.finish()]);
+    shown++;
+    if (now - shownAt > 500) {
+      hud.textContent = `${count.toLocaleString("en")} particles · ${((shown * 1000) / (now - shownAt)).toFixed(0)} fps${paused ? " · paused" : ""} · ${gpuName}`;
+      shownAt = now, shown = 0;
+    }
+    if (times.length >= maxFrames) {
+      const t = times.slice(10).sort((a, b) => a - b), q = (f) => t[Math.min(t.length - 1, Math.floor(t.length * f))].toFixed(2);
+      return say(`${times.length} frames in ${((now - start) / 1000).toFixed(2)} s; frame time median ${q(0.5)} ms, 99th percentile ${q(0.99)} ms; ${count.toLocaleString("en")} particles`);
+    }
+    requestAnimationFrame(frame);
+  });
+</script>

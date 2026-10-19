@@ -33,15 +33,33 @@ pub fn start(cache: &std::path::Path) -> bool {
         external_message_pump: 1,
         no_sandbox: 1,
         root_cache_path: cache.to_string_lossy().as_ref().into(),
-        log_severity: if std::env::var_os("SALIR_LOG").is_some() { LogSeverity::INFO } else { LogSeverity::ERROR },
+        log_severity: match std::env::var("SALIR_LOG").as_deref() {
+            Ok("verbose") => LogSeverity::VERBOSE,
+            Ok(_) => LogSeverity::INFO,
+            Err(_) => LogSeverity::ERROR,
+        },
         ..Default::default()
     };
     initialize(Some(args.as_main_args()), Some(&settings), Some(&mut SalirApp::new()), std::ptr::null_mut()) == 1
 }
 
-/// CEF's work since last asked (when it asked for it: app::schedule_pump).
+/// CEF's work since last asked (when it asked for it: app::schedule_pump, and often).
 pub fn work() {
     do_message_loop_work();
+    // And GLib's: Chromium watches its connections to the desktop (Wayland's, D-Bus) through
+    // GLib's main loop on Linux, which the app has to run when it pumps CEF itself. (Without it a
+    // direct window never hears from the compositor: it's never shown.)
+    #[cfg(target_os = "linux")]
+    for _ in 0..64 {
+        if unsafe { g_main_context_iteration(std::ptr::null_mut(), 0) } == 0 {
+            break;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn g_main_context_iteration(context: *mut std::ffi::c_void, may_block: i32) -> i32;
 }
 
 pub fn shutdown() {
@@ -54,7 +72,8 @@ wrap_app! {
     impl App {
         fn on_before_command_line_processing(&self, _process_type: Option<&CefStringUtf16>, command_line: Option<&mut CommandLine>) {
             let Some(command_line) = command_line else { return };
-            for switch in ["no-startup-window", "noerrdialogs", "hide-crash-restore-bubble", "disable-session-crashed-bubble"] {
+            // (And nothing to Google behind the page's back: Chrome's updates, pings, checks.)
+            for switch in ["no-startup-window", "noerrdialogs", "hide-crash-restore-bubble", "disable-session-crashed-bubble", "disable-background-networking", "disable-component-update", "disable-domain-reliability", "disable-client-side-phishing-detection", "no-pings", "disable-sync"] {
                 command_line.append_switch(Some(&switch.into()));
             }
             // SALIR_CHROMIUM_FLAGS="name=value name": Chromium's own switches, passed on.
@@ -144,6 +163,8 @@ pub struct PageState {
     pub error: Option<String>,
     /// CEF's buffers, as imported (it draws into a few, in turn): by the dmabuf's identity.
     pub(crate) imported: HashMap<u64, Layer>,
+    /// A direct page's window (CEF's own), once made.
+    pub(crate) window: Option<Window>,
 }
 
 impl PageState {
@@ -328,7 +349,7 @@ wrap_context_menu_handler! {
 wrap_client! {
     struct SalirClient {
         shared: Shared,
-        renderer: RenderHandler,
+        renderer: Option<RenderHandler>,
         display: DisplayHandler,
         life_span: LifeSpanHandler,
         menu: ContextMenuHandler,
@@ -336,7 +357,7 @@ wrap_client! {
 
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
-            Some(self.renderer.clone())
+            self.renderer.clone() // (None: a direct page, drawing into its own window)
         }
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(self.display.clone())
@@ -362,35 +383,65 @@ wrap_client! {
     }
 }
 
-/// A page: a browser drawing off screen, and what's done to it.
+/// A direct page's window: CEF's own, Chromium drawing into it and showing it (no
+/// compositing: as a browser does), none of salir's embeds.
+pub struct DirectWindow {
+    pub title: Option<String>,
+    pub width: i32,
+    pub height: i32,
+    pub app_id: Option<String>,
+}
+
+/// A page, and what's done to it: off screen (drawn into the window salir composes), or
+/// direct (in a window of its own).
 pub struct Page {
-    browser: Browser,
+    browser: Option<Browser>,
+    view: Option<BrowserView>, // (a direct page's: its browser comes later)
+    shared: Shared,
 }
 
 impl Page {
-    /// A page at `url`; its frames handed over on the GPU where salir can take them so.
-    pub fn open(shared: &Shared, url: &str) -> Option<Page> {
+    /// A page at `url`; off screen, its frames handed over on the GPU where salir can take
+    /// them so; or, `direct`, in a window of its own. `background`: ARGB, under the page.
+    pub fn open(shared: &Shared, url: &str, direct: Option<DirectWindow>, background: u32) -> Option<Page> {
+        let settings = BrowserSettings {
+            windowless_frame_rate: 60,
+            background_color: if direct.is_some() { background } else { 0 }, // (off screen: see-through where the page is, embeds show there)
+            ..Default::default()
+        };
+        let renderer = direct.is_none().then(|| Renderer::new(shared.clone()));
+        let mut client = SalirClient::new(shared.clone(), renderer, Display::new(shared.clone()), LifeSpan::new(shared.clone()), NoMenu::new());
+        if let Some(direct) = direct {
+            let view = browser_view_create(Some(&mut client), Some(&url.into()), Some(&settings), None, None, Some(&mut PlainView::new()))?;
+            window_create_top_level(Some(&mut DirectDelegate::new(view.clone(), shared.clone(), direct.title, direct.width, direct.height, direct.app_id)))?;
+            return Some(Page { browser: None, view: Some(view), shared: shared.clone() });
+        }
         let window_info = WindowInfo {
             windowless_rendering_enabled: 1,
             shared_texture_enabled: cfg!(target_os = "linux") as _,
             ..Default::default()
         };
-        let settings = BrowserSettings {
-            windowless_frame_rate: 60,
-            background_color: 0, // (see-through where the page is: embeds show there)
-            ..Default::default()
-        };
-        let mut client = SalirClient::new(shared.clone(), Renderer::new(shared.clone()), Display::new(shared.clone()), LifeSpan::new(shared.clone()), NoMenu::new());
-        browser_host_create_browser_sync(Some(&window_info), Some(&mut client), Some(&url.into()), Some(&settings), None, None).map(|browser| Page { browser })
+        browser_host_create_browser_sync(Some(&window_info), Some(&mut client), Some(&url.into()), Some(&settings), None, None).map(|browser| Page { browser: Some(browser), view: None, shared: shared.clone() })
+    }
+
+    fn browser(&self) -> Option<Browser> {
+        self.browser.clone().or_else(|| self.view.as_ref()?.browser())
+    }
+
+    /// A direct page's title shown (its window's).
+    pub fn set_title(&self, title: &str) {
+        if let Some(w) = &self.shared.state.borrow().window {
+            w.set_title(Some(&title.into()));
+        }
     }
 
     fn host(&self) -> Option<BrowserHost> {
-        self.browser.host()
+        self.browser()?.host()
     }
 
     /// Runs `code` in the page.
     pub fn run(&self, code: &str) {
-        if let Some(frame) = self.browser.main_frame() {
+        if let Some(frame) = self.browser().and_then(|b| b.main_frame()) {
             frame.execute_java_script(Some(&code.into()), None, 0);
         }
     }
@@ -420,8 +471,11 @@ impl Page {
 
     /// Closed (its unload handlers run first): PageState.closed once it is.
     pub fn close(&self) {
-        if let Some(h) = self.host() {
-            h.close_browser(0);
+        let window = self.shared.state.borrow().window.clone();
+        match (window, self.host()) {
+            (Some(w), _) => w.close(), // (a direct page's window: it asks the page, can_close)
+            (None, Some(h)) => h.close_browser(0),
+            (None, None) => self.shared.state.borrow_mut().closed = true,
         }
     }
 
@@ -477,6 +531,92 @@ impl Page {
     pub fn text(&self, text: &str) {
         if let Some(h) = self.host() {
             h.ime_commit_text(Some(&text.into()), Some(&Range { from: u32::MAX, to: u32::MAX }), 0);
+        }
+    }
+}
+
+// A direct page's view: plain (no browser around it: no toolbar, no tabs).
+wrap_browser_view_delegate! {
+    struct PlainView {} // (not `struct PlainView;`: cef-rs's macro loses the ViewDelegate block that way)
+
+    impl ViewDelegate {}
+
+    impl BrowserViewDelegate {
+        fn browser_runtime_style(&self) -> RuntimeStyle {
+            RuntimeStyle::ALLOY
+        }
+    }
+}
+
+wrap_window_delegate! {
+    struct DirectDelegate {
+        view: BrowserView,
+        shared: Shared,
+        title: Option<String>,
+        width: i32,
+        height: i32,
+        app_id: Option<String>,
+    }
+
+    impl ViewDelegate {
+        // Its size to begin with (the page's view has none of its own).
+        fn preferred_size(&self, _view: Option<&mut View>) -> Size {
+            Size { width: self.width, height: self.height }
+        }
+    }
+
+    impl PanelDelegate {}
+
+    impl WindowDelegate {
+        fn initial_bounds(&self, _window: Option<&mut Window>) -> Rect {
+            Rect { x: 0, y: 0, width: self.width, height: self.height }
+        }
+
+        // Resizable (else its size is fixed: min = max, and a tiling compositor floats it).
+        fn can_resize(&self, _window: Option<&mut Window>) -> ::std::os::raw::c_int {
+            1
+        }
+
+        fn can_maximize(&self, _window: Option<&mut Window>) -> ::std::os::raw::c_int {
+            1
+        }
+
+        fn can_minimize(&self, _window: Option<&mut Window>) -> ::std::os::raw::c_int {
+            1
+        }
+
+        fn on_window_created(&self, window: Option<&mut Window>) {
+            let Some(window) = window else { return };
+            trace!("direct window made");
+            window.add_child_view(Some(&mut View::from(&self.view)));
+            window.set_title(Some(&self.title.as_deref().unwrap_or("salir").into()));
+            window.show();
+            self.view.request_focus();
+            self.shared.state.borrow_mut().window = Some(window.clone());
+        }
+
+        fn on_window_destroyed(&self, _window: Option<&mut Window>) {
+            trace!("direct window gone");
+            let mut state = self.shared.state.borrow_mut();
+            state.window = None;
+            state.closed = true;
+        }
+
+        // Closed only once the page agrees (its beforeunload).
+        fn can_close(&self, _window: Option<&mut Window>) -> ::std::os::raw::c_int {
+            self.view.browser().and_then(|b| b.host()).map_or(1, |h| h.try_close_browser())
+        }
+
+        fn window_runtime_style(&self) -> RuntimeStyle {
+            RuntimeStyle::ALLOY
+        }
+
+        fn linux_window_properties(&self, _window: Option<&mut Window>, properties: Option<&mut LinuxWindowProperties>) -> ::std::os::raw::c_int {
+            let (Some(app_id), Some(p)) = (&self.app_id, properties) else { return 0 };
+            p.wayland_app_id = app_id.as_str().into();
+            p.wm_class_class = app_id.as_str().into();
+            p.wm_class_name = app_id.as_str().into();
+            1
         }
     }
 }

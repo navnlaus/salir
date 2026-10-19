@@ -9,14 +9,17 @@
 //
 //   <salir-embed kind="video" src="…" input></salir-embed>
 //     its size and place: CSS's (display: block unless styled otherwise)
-//     its attributes (but kind, input, id, class, style, tabindex): its options, as strings;
+//     its attributes (but kind, input, lock, id, class, style, tabindex): its options, as strings;
 //       changed later: a message {"attribute": {"name", "value"}} (value null: removed)
 //     kind changed, or the element put elsewhere: made again
-//     input: the element's pointer, wheel and keys to it too
-//     el.send(message); el.addEventListener("message" / "error", (e) => e.detail)
+//     input: the element's pointer, wheel and keys to it too, through the page
+//     input="direct": the window's input to it straight (not to the page: a game's), till
+//       the attribute's gone, or the embed gives it back (the attribute removed, a
+//       "release" event); lock: the pointer locked and hidden too (raw motion)
+//     el.send(message); el.addEventListener("message" / "error" / "release", (e) => e.detail)
 //
-// or from script: salir.embed(element, kind, options) -> { send(message), on(fn), remove() }
-//   (options.input: as the attribute).
+// or from script: salir.embed(element, kind, options) -> { send(message), on(fn), input(mode, lock), remove() }
+//   (options.input: true, or "direct"; options.lock: as the attributes).
 (() => {
   if (globalThis.salir) return;
   const native = globalThis.__salirSend;
@@ -78,7 +81,14 @@
       const e = { element, handlers: new Set(), last: "" };
       embeds.set(id, e);
       post({ $: "embed.create", id, kind, options });
-      const stopInput = options.input ? forward(id, element) : () => {};
+      let stopInput = () => {};
+      const input = (mode, lock = false) => {
+        // "page": the element's input passed on by the page; "direct": the window's, straight.
+        stopInput();
+        stopInput = mode === "page" ? forward(id, element) : () => {};
+        post({ $: "embed.input", id, mode: mode || "none", lock: !!lock });
+      };
+      input(options.input === "direct" ? "direct" : options.input ? "page" : "none", options.lock);
       if (!following) requestAnimationFrame(follow), (following = true);
       return Object.freeze({
         id,
@@ -87,6 +97,7 @@
           e.handlers.add(fn);
           return () => e.handlers.delete(fn);
         },
+        input,
         remove() {
           if (!embeds.delete(id)) return;
           stopInput();
@@ -98,7 +109,10 @@
     _receive(m) {
       if (m.$ === "message") for (const fn of listeners) fn(m.message);
       else if (m.$ === "embed.message") for (const fn of embeds.get(m.id)?.handlers ?? []) fn(m.message);
-      else if (m.$ === "embed.error") {
+      else if (m.$ === "embed.released") {
+        const e = embeds.get(m.id);
+        for (const fn of e?.handlers ?? []) fn({ released: true });
+      } else if (m.$ === "embed.error") {
         console.error(`salir.embed ${m.id}: ${m.error}`);
         for (const fn of embeds.get(m.id)?.handlers ?? []) fn({ error: m.error });
       }
@@ -106,7 +120,7 @@
   });
 
   if (top && !customElements.get("salir-embed")) {
-    const RESERVED = new Set(["kind", "input", "id", "class", "style", "tabindex"]); // (tabindex: input's, to have the keys)
+    const RESERVED = new Set(["kind", "input", "lock", "id", "class", "style", "tabindex"]); // (tabindex: input's, to have the keys)
     let styled = false;
     customElements.define("salir-embed", class SalirEmbed extends HTMLElement {
       #handle = null;
@@ -139,15 +153,27 @@
         this.#handle = null;
         const kind = this.getAttribute("kind");
         if (!kind) return;
-        const options = { input: this.hasAttribute("input") };
+        const options = { input: this.#mode() === "direct" ? "direct" : this.#mode() === "page", lock: this.hasAttribute("lock") };
         for (const a of this.attributes) if (!RESERVED.has(a.name)) options[a.name] = a.value;
         this.#handle = salir.embed(this, kind, options);
-        this.#handle.on((m) => this.dispatchEvent(new CustomEvent(m && typeof m === "object" && "error" in m ? "error" : "message", { detail: m })));
+        this.#handle.on((m) => {
+          if (m && typeof m === "object" && m.released) {
+            this.removeAttribute("input"); // (given back: the page has the input again)
+            this.dispatchEvent(new CustomEvent("release"));
+          } else this.dispatchEvent(new CustomEvent(m && typeof m === "object" && "error" in m ? "error" : "message", { detail: m }));
+        });
+      }
+
+      // "none", "page" (input), "direct" (input="direct").
+      #mode() {
+        const v = this.getAttribute("input");
+        return v === null ? "none" : v === "direct" ? "direct" : "page";
       }
 
       #changed(changes) {
         const names = new Set(changes.map((c) => c.attributeName));
-        if (names.has("kind") || names.has("input")) return this.#make();
+        if (names.has("kind")) return this.#make();
+        if (names.has("input") || names.has("lock")) this.#handle?.input(this.#mode(), this.hasAttribute("lock"));
         for (const name of names) {
           if (!RESERVED.has(name)) this.#handle?.send({ attribute: { name, value: this.getAttribute(name) } });
         }

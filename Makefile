@@ -4,6 +4,7 @@
 #   make DEBUG=1         the same with debug symbols: CEF's own (1.4 GB) and salir's
 #   make examples        the example plugin and embed (dist/plugins, dist/salir-particles)
 #   make run             the demo page, with the examples
+#   make run-webgpu      a WebGPU page in a direct window (no compositing)
 #   make install         ./install.sh (PREFIX=~/.local)
 #   make clean           salir's build; `make distclean` CEF too
 #
@@ -28,7 +29,7 @@ endif
 export SALIR_CEF_DIR := $(abspath $(CEF_DIR))
 CARGO_OUT := target/$(PROFILE)
 
-.PHONY: all cef build examples run install uninstall clean distclean
+.PHONY: all cef build examples run run-webgpu install uninstall clean distclean
 all: build
 
 # CEF: downloaded once (cef/downloads), its runtime files only (Release/, Resources/);
@@ -63,6 +64,9 @@ examples: build
 
 run: examples
 	dist/salir-particles --plugin triangle=dist/plugins/libtriangle.so examples/demo/index.html
+
+run-webgpu: build
+	dist/salir --direct examples/webgpu/index.html
 
 install: build
 	PREFIX='$(PREFIX)' ./install.sh

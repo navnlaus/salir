@@ -36,6 +36,7 @@
   </salir-embed>
   <salir-embed kind="particles" count="262144" input id="particles">
     <div class="label">wgpu, the app's own (examples/particles.rs): press in it</div>
+    <div class="over"><button id="play">Play: the window's input to it directly</button><span id="playing">(Esc gives it back)</span></div>
   </salir-embed>
 </main>
 <footer id="log">Ready.</footer>
@@ -43,6 +44,7 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const log = (text) => (($("log").textContent = text), console.log(text));
+  addEventListener("keydown", (e) => console.log(`page keydown: ${e.key}`)); // (to see where keys go)
   const auto = new URLSearchParams(location.search).has("auto");
 
   if (!window.salir) log("Not in salir: no window.salir here.");
@@ -52,6 +54,9 @@
     $("triangle").addEventListener("error", (e) => ($("frames").textContent = e.detail.error));
     $("particles").addEventListener("error", (e) => log(e.detail.error));
     $("speed").oninput = (e) => $("triangle").setAttribute("speed", e.target.value);
+    // Direct input: the window's mouse and keys to the particles, not the page (a game's way).
+    $("play").onclick = () => $("particles").setAttribute("input", "direct");
+    $("particles").addEventListener("release", () => log("The particles gave the input back."));
     $("tell").onclick = () => salir.send({ said: $("say").value || "(nothing)" });
     $("say").onkeydown = (e) => {
       if (e.key === "Enter") log(`Typed: ${e.target.value}`);
@@ -70,6 +75,7 @@
         parent.append(p);
       }, 1800);
       setTimeout(() => salir.send({ auto: "the page says hello", frames: $("frames").textContent }), 2500);
+      setTimeout(() => $("play").click(), 2600); // (then keys typed go to the particles; Escape: back)
     }
   }
 </script>

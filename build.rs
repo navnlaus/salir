@@ -8,5 +8,6 @@ fn main() {
     }
     println!("cargo:rustc-link-search=native={dir}");
     println!("cargo:rustc-link-lib=dylib=cef");
+    println!("cargo:rustc-link-lib=dylib=glib-2.0"); // (Linux: its main loop run, browser::work; libcef loads it anyway)
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
 }

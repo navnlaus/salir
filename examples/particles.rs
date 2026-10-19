@@ -1,10 +1,11 @@
 //! An app on salir with an embed of its own, drawn with wgpu: particles moved
-//! by a compute shader, pulled where the page's element is pressed (its input,
-//! passed on). Plugins too, as salir's own command takes them.
+//! by a compute shader, pulled where the page's element is pressed: its input
+//! passed on by the page, or the window's straight (input="direct", as a game's;
+//! Escape gives it back). Plugins too, as salir's own command takes them.
 //!
 //!   salir-particles [--plugin KIND=PATH]... page.html
 
-use salir::{Embed, Frame, Link, Salir, Value, WindowOptions};
+use salir::{Embed, Frame, Input, Link, Salir, Value, WindowOptions};
 use std::process::ExitCode;
 
 const SHADER: &str = r#"
@@ -45,6 +46,7 @@ struct Particles {
     pull_at: [f32; 2],
     pull: f32,
     last: std::time::Instant,
+    css_size: (f32, f32), // (its size in CSS pixels: direct input's units)
     gpu: Option<(wgpu::Buffer, wgpu::ComputePipeline, wgpu::RenderPipeline, wgpu::BindGroup, wgpu::BindGroup)>,
 }
 
@@ -91,6 +93,7 @@ impl Embed for Particles {
             self.setup(f);
         }
         let (uniforms, step, draw, sg, dg) = self.gpu.as_ref().unwrap();
+        self.css_size = (f.width as f32 / f.scale, f.height as f32 / f.scale);
         let dt = self.last.elapsed().as_secs_f32().min(1.0 / 30.0);
         self.last = std::time::Instant::now();
         let u = [self.pull_at[0], self.pull_at[1], self.pull, dt, 3.0 / f.width as f32, 3.0 / f.height as f32, f.width as f32 / f.height as f32, 0.0];
@@ -115,6 +118,18 @@ impl Embed for Particles {
         self.link.request_frame(); // (always moving)
     }
 
+    // The window's input, straight (input="direct": as a game would have it). Escape gives it back.
+    fn input(&mut self, input: &Input) {
+        let (w, h) = (self.css_size.0.max(1.0), self.css_size.1.max(1.0));
+        match input {
+            Input::Move { x, y } => self.pull_at = [x / w * 2.0 - 1.0, 1.0 - y / h * 2.0],
+            Input::Button { button, down, .. } => self.pull = if !down { 0.0 } else if *button == 2 { -1.0 } else { 1.0 },
+            Input::Key { key, down: true, .. } if key == "Escape" => self.link.release_input(), // (key: what it means; code: where it is, WASD's)
+            Input::Key { code, key, down, .. } => eprintln!("particles: {code} ({key}) {}", if *down { "down" } else { "up" }),
+            _ => {}
+        }
+    }
+
     // The element's input (the page asked for it: {input: true}), in CSS pixels from its top left.
     fn message(&mut self, message: Value) {
         let Some(input) = message.get("input") else { return };
@@ -136,7 +151,7 @@ fn main() -> ExitCode {
     let mut salir = Salir::new("salir-particles").embed("particles", |options, link| {
         // (A number, or a string: <salir-embed count="262144">.)
         let count = options.get("count").and_then(|c| c.as_u64().or_else(|| c.as_str()?.parse().ok())).unwrap_or(1 << 18) as u32;
-        Ok(Box::new(Particles { link, count, pull_at: [0.0, 0.0], pull: 0.0, last: std::time::Instant::now(), gpu: None }) as Box<dyn Embed>)
+        Ok(Box::new(Particles { link, count, pull_at: [0.0, 0.0], pull: 0.0, last: std::time::Instant::now(), css_size: (1.0, 1.0), gpu: None }) as Box<dyn Embed>)
     });
     let mut page = None;
     let mut i = 0;

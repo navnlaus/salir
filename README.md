@@ -7,11 +7,18 @@ element of the page is, drawn with wgpu or OpenGL (a video through libmpv's
 render API, a game, a 3D view), with the page's HTML over it.
 
 ```
- window (wgpu)
- ├── embeds    native, where the page's elements are (salir.embed)
- ├── page      CEF, off screen: its frames as GPU textures (dmabufs)
+ window (wgpu)                                    direct window (--direct)
+ ├── embeds    native, where the page's elements   └── page   Chromium draws it and shows
+ │             are (<salir-embed>)                            it itself, as a browser does:
+ ├── page      CEF, off screen: its frames as                 no compositing, no embeds
+ │             GPU textures (dmabufs)
  └── popup     a <select>'s list
 ```
+
+A game can be either: native, drawn with wgpu in an embed (its HUD in HTML over
+it; the window's input straight to it, `input="direct"`), or all Chromium,
+WebGPU in the page, in a direct window (nothing of salir's between Chromium and
+the screen: `examples/webgpu`).
 
 Linux (x86-64, Wayland or X11) so far; the rest is kept portable (wgpu, winit,
 CEF all are) for Windows and macOS to follow.
@@ -22,6 +29,7 @@ CEF all are) for Windows and macOS to follow.
 make              # CEF (downloaded once, checked, stripped), then salir: dist/
 make DEBUG=1      # the same with debug symbols, CEF's (1.4 GB) and salir's
 make run          # the demo (examples/demo), with the examples built
+make run-webgpu   # examples/webgpu in a direct window
 make install      # ~/.local/bin/salir, ~/.local/lib/salir/ (PREFIX=… for elsewhere)
 make uninstall
 ```
@@ -42,6 +50,7 @@ calls are all in `src/browser.rs`.
 ```sh
 salir page.html                              # a window with the page
 salir --plugin video=libmyvideo.so app.html  # embeds of kind "video" from a plugin
+salir --direct game.html                     # Chromium's own window: no compositing, no embeds
 salir --control                              # driven by another program (below)
 ```
 
@@ -63,11 +72,17 @@ An embed is an element, sized and placed by CSS like any:
   options, as strings; one changed later reaches it as
   `{"attribute": {"name", "value"}}` (value `null`: removed). `kind` changed, or
   the element moved elsewhere in the page: it's made again.
-- `input`: the element's pointer, wheel and key events go to the embed too
-  (`{"input": {"type", "x", "y", "width", "height", "button", "key"…}}`, CSS
-  pixels from the element's top left).
+- `input`: the element's pointer, wheel and key events go to the embed too,
+  passed on by the page (`{"input": {"type", "x", "y", "width", "height",
+  "button", "key"…}}`, CSS pixels from the element's top left) — for a video's
+  controls, say.
+- `input="direct"`: the **window's** input goes straight to the embed instead
+  of to the page (a game's: no round trip through the page), till the attribute
+  is removed or the embed gives it back (`link.release_input()`, Escape say:
+  the attribute's removed, a `release` event fires on the element). `lock` too:
+  the pointer locked and hidden, the mouse's raw motion given (FPS-style).
 - `el.send(message)` to it; `message` events (`e.detail`) from it, `error` if it
-  couldn't be made.
+  couldn't be made, `release` when it gave the input back.
 
 It's drawn under the page where the element is, following it as the page lays
 out and scrolls; the page shows it where the page is see-through there (no
@@ -96,6 +111,8 @@ salir::Salir::new("my-app")
     .run()
 ```
 
+`Embed::input` gets the window's input when it has it directly (`salir::Input`:
+moves, raw motion, buttons, wheel, keys by place — `"KeyW"` — and by meaning).
 `Embed::render` draws into a wgpu texture salir keeps for it, on every system
 (wgpu: Vulkan, Direct3D 12, Metal). GL embeds and plugins are **Linux only** (EGL
 and dmabufs): for what only comes as OpenGL there, libmpv's render API above
@@ -119,7 +136,7 @@ salir shows that framebuffer as a window shows GL's (y up), so libmpv would want
 JSON lines, commands on stdin, events on stdout (`src/control.rs`):
 
 ```
-→ {"open": {"id": "w1", "url": "…", "title"?, "width"?, "height"?, "app_id"?, "background"?: [r, g, b, a]}}
+→ {"open": {"id": "w1", "url": "…", "title"?, "width"?, "height"?, "app_id"?, "background"?: [r, g, b, a], "direct"?: true}}
 → {"send": {"window": "w1", "message": …}}        (salir.on in the page)
 → {"close": "w1"}      → {"quit": true}             (or stdin closed)
 ← {"ready": true}  {"opened": "w1"}  {"closed": "w1"}  {"error": "…"}
@@ -130,15 +147,25 @@ JSON lines, commands on stdin, events on stdout (`src/control.rs`):
 ### Debugging
 
 `SALIR_TRACE=1` (what salir does), `SALIR_CONSOLE=1` (pages' console),
-`SALIR_LOG=1` (CEF's log), `SALIR_CHROMIUM_FLAGS="name=value …"` (Chromium's switches).
+`SALIR_LOG=1` or `verbose` (CEF's log, in its cache folder: `chrome_debug.log`),
+`SALIR_CHROMIUM_FLAGS="name=value …"` (Chromium's switches).
+
+A direct window's input reaches Chromium as salir does CEF's work, so salir
+does it every 4 ms while one is open (every 33 ms at most otherwise, and when
+CEF asks), and runs GLib's main loop with it: Chromium hears from the
+compositor through it on Linux.
 
 ## Tested so far
 
 On a GTX 1080 Ti (NVIDIA 580), in a headless Wayland compositor: pages as GPU
 textures; a GL plugin and a wgpu embed under the demo page, their messages both
 ways, input passed to an embed; `<select>` popups; text typed with real key
-events (`þé` too); `--control` with two windows; 400 embeds made and removed
-(no file descriptors or memory left behind). Not yet: resizing a window, a
+events (`þé` too); `--control` with two windows, direct and composited; 400
+embeds made and removed (no file descriptors or memory left behind); resizing;
+a direct window with 1 M WebGPU particles at 60 fps; an embed given the
+window's keys directly, and giving them back. Not yet: resizing a window, a
 mouse moved by hand (the compositor has none), HiDPI, AMD and Intel GPUs,
 Windows, macOS, the clipboard. Not handled yet: drag and drop, JavaScript
 dialogs (`alert()`), file pickers, IME composition (typed text does go through).
+Chrome's background services (component updates, a time check) still reach
+Google despite the switches salir passes to stop them: to look into.

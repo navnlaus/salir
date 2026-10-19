@@ -25,8 +25,44 @@ pub struct Frame<'a> {
 pub trait Embed {
     /// Draw: when it's made, resized, or after link.request_frame().
     fn render(&mut self, frame: &Frame);
-    /// A message from the page (handle.send(message); its input as {"input": {...}}).
+    /// A message from the page (handle.send(message); input the page passed on, as {"input": {...}}).
     fn message(&mut self, _message: Value) {}
+    /// The window's input, straight from it (the element's input="direct"): not through the page.
+    fn input(&mut self, _input: &Input) {}
+}
+
+/// The window's input, given to an embed directly (input="direct"). Places: CSS pixels
+/// from the embed's top left.
+#[derive(Clone, Debug)]
+pub enum Input {
+    /// The pointer moved to (x, y).
+    Move { x: f32, y: f32 },
+    /// The mouse moved by (dx, dy), its own units (raw: locked or not, at the screen's edge too).
+    Motion { dx: f64, dy: f64 },
+    /// `button`: 0 left, 1 middle, 2 right, 3 back, 4 forward.
+    Button { button: u8, down: bool, x: f32, y: f32 },
+    /// Scrolled: in lines (a mouse's wheel), or pixels (a touchpad's).
+    Wheel { dx: f32, dy: f32, lines: bool },
+    /// `code`: where it is (DOM's names: "KeyW", "Space", "ArrowUp"); `key`: what it is in the
+    /// layout ("w", "Enter"); `text`: what it types, if anything.
+    Key { code: String, key: String, down: bool, repeat: bool, text: Option<String> },
+    /// The window got (true) or lost the keyboard.
+    Focus(bool),
+}
+
+impl Input {
+    /// As JSON ({"type": "move", ...}): what a plugin is given ({"input": this}).
+    pub fn to_json(&self) -> Value {
+        use serde_json::json;
+        match self {
+            Input::Move { x, y } => json!({ "type": "move", "x": x, "y": y, "direct": true }),
+            Input::Motion { dx, dy } => json!({ "type": "motion", "dx": dx, "dy": dy, "direct": true }),
+            Input::Button { button, down, x, y } => json!({ "type": if *down { "down" } else { "up" }, "button": button, "x": x, "y": y, "direct": true }),
+            Input::Wheel { dx, dy, lines } => json!({ "type": "wheel", "dx": dx, "dy": dy, "lines": lines, "direct": true }),
+            Input::Key { code, key, down, repeat, text } => json!({ "type": if *down { "keydown" } else { "keyup" }, "code": code, "key": key, "repeat": repeat, "text": text, "direct": true }),
+            Input::Focus(f) => json!({ "type": if *f { "focus" } else { "blur" }, "direct": true }),
+        }
+    }
 }
 
 /// What an embed draws with OpenGL: `fbo`, `width`×`height` pixels, as GL draws (y up).
@@ -37,10 +73,11 @@ pub struct GlFrame {
     pub scale: f32,
 }
 
-/// Native content drawn with OpenGL, in salir's context (current in every call).
+/// Native content drawn with OpenGL, in salir's context (current in every call). Linux only.
 pub trait GlEmbed {
     fn render(&mut self, frame: &GlFrame);
     fn message(&mut self, _message: Value) {}
+    fn input(&mut self, _input: &Input) {}
 }
 
 /// GL's (and EGL's) functions, by name, for a GlEmbed to load.
@@ -66,5 +103,11 @@ impl Link {
     /// render() again, at the next frame (once however often it's asked for before then).
     pub fn request_frame(&self) {
         let _ = self.proxy.send_event(crate::app::Event::EmbedFrame { window: self.window, embed: self.embed });
+    }
+
+    /// The window's input back to the page (input="direct" no more: its element's input
+    /// attribute removed, a "release" event on it). Escape's, say.
+    pub fn release_input(&self) {
+        let _ = self.proxy.send_event(crate::app::Event::EmbedRelease { window: self.window, embed: self.embed });
     }
 }

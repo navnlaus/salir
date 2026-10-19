@@ -1,6 +1,6 @@
 //! Plugins: GL embeds in a shared library, any language, through include/salir.h.
 
-use crate::embed::{GlEmbed, GlEmbedFactory, GlFrame, Link, ProcAddress};
+use crate::embed::{GlEmbed, GlEmbedFactory, GlFrame, Input, Link, ProcAddress};
 use serde_json::Value;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
@@ -87,6 +87,11 @@ impl GlEmbed for PluginEmbed {
     fn message(&mut self, message: Value) {
         let json = CString::new(message.to_string()).unwrap_or_default();
         unsafe { ((*self.api).message)(self.instance, json.as_ptr()) }
+    }
+
+    // (Direct input: as a message, {"input": {..., "direct": true}}.)
+    fn input(&mut self, input: &Input) {
+        self.message(serde_json::json!({ "input": input.to_json() }));
     }
 }
 

@@ -2,6 +2,8 @@
 //!
 //!   --plugin KIND=PATH   embeds of KIND from a plugin (include/salir.h); again for more
 //!   --control            driven through stdin/stdout, JSON lines (src/control.rs)
+//!   --direct             the page in a window of its own, drawn and shown by Chromium:
+//!                        no compositing, no embeds (a WebGPU game, an app's UI)
 //!   --title TITLE        the window's (else the page's)
 //!   --size WxH           in CSS pixels (1280x800)
 //!   --app-id ID          its Wayland app id, for window rules
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
             let mut w = WindowOptions::new("main", to_url(url));
             w.title = value(&args, "--title").map(str::to_owned);
             w.app_id = value(&args, "--app-id").map(str::to_owned);
+            w.direct = args.iter().any(|a| a == "--direct");
             if let Some((width, height)) = value(&args, "--size").and_then(|s| s.split_once('x')).and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))) {
                 (w.width, w.height) = (width, height);
             }
@@ -62,6 +65,6 @@ fn to_url(s: &str) -> String {
 }
 
 fn usage(what: &str) -> ExitCode {
-    eprintln!("salir: {what}\nusage: salir [--plugin KIND=PATH]... [--control] [--title T] [--size WxH] [--app-id ID] [--name NAME] [URL or file]");
+    eprintln!("salir: {what}\nusage: salir [--plugin KIND=PATH]... [--control] [--direct] [--title T] [--size WxH] [--app-id ID] [--name NAME] [URL or file]");
     ExitCode::from(2)
 }
