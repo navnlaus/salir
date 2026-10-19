@@ -52,6 +52,7 @@ fn parse(v: &Value) -> Result<Command, String> {
         let url = o.get("url").and_then(s).ok_or("open: no url")?;
         let mut w = WindowOptions::new(id, url);
         w.title = o.get("title").and_then(s);
+        w.initial_title = o.get("initial_title").and_then(s);
         w.app_id = o.get("app_id").and_then(s);
         if let Some(n) = o.get("width").and_then(Value::as_u64) {
             w.width = n as u32;

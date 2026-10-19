@@ -40,6 +40,9 @@ pub struct WindowOptions {
     pub url: String,
     /// Fixed; None: the page's.
     pub title: Option<String>,
+    /// Its title till the page has one (window rules match it: a window told apart from the
+    /// others as it opens). None: "salir".
+    pub initial_title: Option<String>,
     pub width: u32,
     pub height: u32,
     /// Its Wayland app id (window rules); None: the program's.
@@ -53,7 +56,7 @@ pub struct WindowOptions {
 
 impl WindowOptions {
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> WindowOptions {
-        WindowOptions { id: id.into(), url: url.into(), title: None, width: 1280, height: 800, app_id: None, background: [0.0, 0.0, 0.0, 1.0], direct: false }
+        WindowOptions { id: id.into(), url: url.into(), title: None, initial_title: None, width: 1280, height: 800, app_id: None, background: [0.0, 0.0, 0.0, 1.0], direct: false }
     }
 }
 

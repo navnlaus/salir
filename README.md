@@ -139,7 +139,8 @@ salir shows that framebuffer as a window shows GL's (y up), so libmpv would want
 JSON lines, commands on stdin, events on stdout (`src/control.rs`):
 
 ```
-→ {"open": {"id": "w1", "url": "…", "title"?, "width"?, "height"?, "app_id"?, "background"?: [r, g, b, a], "direct"?: true}}
+→ {"open": {"id": "w1", "url": "…", "title"?, "initial_title"?, "width"?, "height"?, "app_id"?, "background"?: [r, g, b, a], "direct"?: true}}
+                       (initial_title: the title till the page sets its own: a window rule's to match)
 → {"send": {"window": "w1", "message": …}}        (salir.on in the page)
 → {"close": "w1"}      → {"quit": true}             (or stdin closed)
 → {"trust_certificate": "-----BEGIN CERTIFICATE-----…"}   (as --trust-certificate)
