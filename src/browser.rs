@@ -14,6 +14,9 @@ use winit::window::CursorIcon;
 
 const BRIDGE: &str = include_str!("bridge.js");
 
+// How long after a frame it's copied again (PageState::settle): its drawing through by then.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
+
 // Certificates trusted whatever their errors (an app's own server's, made for the run: its
 // HTTPS, for HTTP/2), as DER: exactly these, nothing else.
 static TRUSTED: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
@@ -207,6 +210,13 @@ pub struct PageState {
     pub error: Option<String>,
     /// CEF's buffers, as imported (it draws into a few, in turn): by the dmabuf's identity.
     pub(crate) imported: HashMap<u64, Layer>,
+    /// The buffers the page and its popup last came in (their keys in `imported`), and when to
+    /// copy them again (settle): CEF hands a frame over with nothing to wait on, and copied
+    /// there and then it can be the pool buffer as it last was, a frame from before (shown
+    /// till the next: a <select>'s highlight a step behind, a panel shut a moment after it
+    /// opened). Copied again a little later, it's the frame as drawn.
+    pub(crate) last: [Option<u64>; 2],
+    pub settle_at: Option<std::time::Instant>,
     /// A direct page's window (CEF's own), once made.
     pub(crate) window: Option<Window>,
     /// salir.files(): the paths asked for, by token, till the page's file dialog for them comes;
@@ -219,6 +229,19 @@ impl PageState {
     /// Resized: CEF's buffers are new ones now.
     pub fn resized(&mut self) {
         self.imported.clear();
+        self.last = [None, None];
+    }
+
+    /// The page's and its popup's last frames copied again (see `last`), now drawn through.
+    pub fn settle(&mut self, gpu: &Gpu) {
+        self.settle_at = None;
+        for (i, key) in self.last.into_iter().enumerate() {
+            let (Some(key), Some((texture, _))) = (key, if i == 0 { &self.page } else { &self.popup }) else { continue };
+            if let Some(layer) = self.imported.get(&key) {
+                gpu.copy(layer, texture);
+                self.painted = true;
+            }
+        }
     }
 
     // Our copy of a frame (the page's, or its popup's), `width`×`height`.
@@ -265,6 +288,7 @@ wrap_render_handler! {
                 let mut state = self.shared.state.borrow_mut();
                 state.popup_rect = None;
                 state.popup = None;
+                state.last[1] = None;
                 state.painted = true;
             }
         }
@@ -300,6 +324,8 @@ wrap_render_handler! {
             let target = state.target(gpu, type_ == PaintElementType::POPUP, width, height).clone();
             gpu.copy(&state.imported[&key], &target);
             state.painted = true;
+            state.last[(type_ == PaintElementType::POPUP) as usize] = Some(key);
+            state.settle_at = Some(std::time::Instant::now() + SETTLE);
             trace!("{} painted, shared: {width}×{height}", if type_ == PaintElementType::POPUP { "popup" } else { "page" });
         }
 

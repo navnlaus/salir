@@ -925,7 +925,24 @@ impl ApplicationHandler<Event> for App {
             return event_loop.exit();
         }
         self.bury(false);
+        // Frames to copy again (browser.rs's PageState::settle), when they're due.
+        let gpu = self.gpu.clone();
+        let mut settle = None::<Instant>;
+        for w in self.windows.values_mut() {
+            let due = w.shared.state.borrow().settle_at;
+            match due {
+                Some(at) if at <= Instant::now() => {
+                    w.shared.state.borrow_mut().settle(&gpu);
+                    w.redraw();
+                }
+                Some(at) => settle = Some(settle.map_or(at, |s: Instant| s.min(at))),
+                None => {}
+            }
+        }
         let mut next = PUMP_AT.lock().unwrap().unwrap_or(now + interval).min(PUMPED.lock().unwrap().unwrap_or(now) + interval);
+        if let Some(at) = settle {
+            next = next.min(at);
+        }
         if !self.dying.is_empty() {
             next = Instant::now(); // (the next at once, after a look at what's come)
         }
