@@ -99,7 +99,7 @@ And messages with the app:
 ```js
 salir.send({ any: "JSON" });              // to the app (--control: stdout)
 salir.on((message) => …);                 // from it
-salir.close();                            // the page's window closed (its unload handlers run)
+salir.close();                            // the page's window closed: off the screen at once, its unload handlers after
 ```
 
 ### Embeds
@@ -125,14 +125,22 @@ is shared with wgpu as a dmabuf. Either draws when made, resized, or asked to
 (`link.request_frame()` — from any thread: libmpv's update callback);
 `link.send()` talks to its page.
 
+An embed removed (its element gone, its window closed) is dropped later, not
+there and then: one a turn of the event loop, from the turn after. Dropping
+one can take a while (libmpv's `mpv_render_context_free`: up to 0.4 s), and in
+between the window it was in is off the screen already, the other windows go
+on answering.
+
 In any language (Linux), a **plugin**: a shared library exporting `salir_plugin_v1`
 (`include/salir.h`, installed with salir) — OpenGL, `create / render / message
 / destroy`, and the host's `get_proc_address / send / request_frame`.
 `examples/triangle/triangle.c` is one. libmpv's render API fits it as it is:
 `get_proc_address` for `MPV_RENDER_PARAM_OPENGL_INIT_PARAMS`, `request_frame`
 from its update callback, `mpv_render_context_render` into the framebuffer given.
-salir shows that framebuffer as a window shows GL's (y up), so libmpv would want
-`MPV_RENDER_PARAM_FLIP_Y` 1, as for a window (not tried with libmpv yet).
+salir shows that framebuffer as a window shows GL's (y up), so libmpv wants
+`MPV_RENDER_PARAM_FLIP_Y` 1, as for a window. [phil](https://github.com/navnlaus/Phil)'s
+`native/salir-mpv` is such a plugin: libmpv, decoding on the GPU (nvdec),
+driven by JSON as mpv's own nodes.
 
 ### `--control`
 
