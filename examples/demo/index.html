@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- salir's demo: two embeds under the page, HTML over them.
+       make run      (dist/salir-particles --plugin triangle=dist/plugins/libtriangle.so examples/demo/index.html)
+     The page is see-through where it paints nothing: the embeds show there, under its
+     controls. ?auto: it tries things by itself (for tests). -->
+<meta charset="utf-8">
+<title>salir demo</title>
+<style>
+  :root { color-scheme: dark; --panel: #14161d; --line: #2a2e3a; --text: #dfe6f3; --dim: #8f9bb3; --accent: #ff9a4a; }
+  html, body { margin: 0; height: 100%; background: transparent; color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  body { display: grid; grid-template-rows: auto 1fr auto; }
+  header, footer { background: var(--panel); border-bottom: 1px solid var(--line); padding: 10px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  footer { border: 0; border-top: 1px solid var(--line); color: var(--dim); }
+  h1 { font-size: 15px; margin: 0 8px 0 0; }
+  h1 span { color: var(--accent); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; } /* (see-through: the window's background between the screens) */
+  .screen { position: relative; border-radius: 10px; outline: 1px solid var(--line); min-height: 200px; } /* (no background: the embed shows through) */
+  .screen .over { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; gap: 8px; align-items: center; background: rgb(0 0 0 / 0.55); border-radius: 8px; padding: 6px 10px; backdrop-filter: blur(6px); }
+  .screen .label { position: absolute; left: 12px; top: 10px; font-size: 12px; color: #fff; text-shadow: 0 1px 2px #000; }
+  button, select, input { font: inherit; color: var(--text); background: #222634; border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); padding: 0; }
+  a { color: var(--accent); }
+</style>
+
+<header>
+  <h1>salir <span>demo</span></h1>
+  <select id="pick" autofocus><option>A select (its list is a popup)</option><option>Second</option><option>Third</option></select>
+  <input id="say" placeholder="Type, then Enter" spellcheck="false">
+  <button id="tell">salir.send()</button>
+  <a href="https://example.com" target="_blank">A new window's link</a>
+</header>
+<main>
+  <div class="screen" id="triangle">
+    <div class="label">OpenGL, from a plugin (examples/triangle)</div>
+    <div class="over"><span>Speed</span><input type="range" id="speed" min="0" max="6" step="0.5" value="1"><span id="frames">–</span></div>
+  </div>
+  <div class="screen" id="particles">
+    <div class="label">wgpu, the app's own (examples/particles.rs): press in it</div>
+  </div>
+</main>
+<footer id="log">Ready.</footer>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const log = (text) => (($("log").textContent = text), console.log(text));
+  const auto = new URLSearchParams(location.search).has("auto");
+
+  if (!window.salir) log("Not in salir: no window.salir here.");
+  else {
+    salir.on((m) => log(`From the app: ${JSON.stringify(m)}`));
+    const tri = salir.embed($("triangle"), "triangle", { speed: 1 });
+    tri.on((m) => {
+      if (m.error) $("frames").textContent = m.error;
+      else if (m.frames) $("frames").textContent = `${m.frames} frames`;
+    });
+    $("speed").oninput = (e) => tri.send({ speed: Number(e.target.value) });
+    salir.embed($("particles"), "particles", { input: true, count: 262144 }).on((m) => m.error && log(m.error));
+    $("tell").onclick = () => salir.send({ said: $("say").value || "(nothing)" });
+    $("say").onkeydown = (e) => e.key === "Enter" && log(`Typed: ${e.target.value}`);
+
+    if (auto) {
+      // What a person would do, done by the page: the speed changed, a press in the particles, a message.
+      setTimeout(() => ($("speed").value = 4, $("speed").dispatchEvent(new Event("input"))), 800);
+      setTimeout(() => {
+        const el = $("particles"), r = el.getBoundingClientRect();
+        el.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + r.width * 0.25, clientY: r.top + r.height * 0.25, button: 0, buttons: 1, bubbles: true }));
+      }, 1000);
+      setTimeout(() => salir.send({ auto: "the page says hello", frames: $("frames").textContent }), 2500);
+    }
+  }
+</script>

@@ -1,0 +1,30 @@
+[package]
+name = "salir"
+version = "0.1.0"
+edition = "2024"
+description = "Web pages over native GPU content: windows drawn with wgpu, pages drawn by CEF off screen and handed over as GPU textures"
+publish = false
+
+[dependencies]
+# CEF's C API, bindings only ("dox": not cef-rs's build script, which downloads a CEF
+# of its own; the Makefile fetches salir's, build.rs links it).
+cef = { version = "=154.5.0", default-features = false, features = ["dox"] }
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+serde_json = "1"
+libloading = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+libc = "0.2"
+khronos-egl = { version = "6", features = ["dynamic"] }
+
+[profile.release]
+strip = "symbols"
+
+# make DEBUG=1
+[profile.debuginfo]
+inherits = "release"
+debug = true
+strip = "none"

@@ -1,0 +1,531 @@
+//! Everything that touches CEF (cef-rs's bindings to its C API: kept here, so
+//! they could be swapped for others without the rest knowing).
+//!
+//! A page is drawn off screen, each frame handed over as a GPU texture (a dmabuf
+//! on Linux) and copied into the window's own on the GPU, before CEF has its
+//! buffer back. Pages talk to the app through window.salir (bridge.js): bound in
+//! each page's process (the renderer: this program again), as process messages.
+
+use crate::gpu::{Gpu, Layer, PAGE_FORMAT};
+use cef::*;
+use serde_json::Value;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use winit::window::CursorIcon;
+
+const BRIDGE: &str = include_str!("bridge.js");
+const MESSAGE: &str = "salir";
+
+/// This process, if it's one of CEF's others (a page's, the GPU's...): run as
+/// that, its exit code. None: the app's (CEF's browser process).
+pub fn subprocess() -> Option<i32> {
+    let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
+    let args = args::Args::new();
+    let is_browser = args.as_cmd_line().is_none_or(|cmd| cmd.has_switch(Some(&"type".into())) != 1);
+    let code = execute_process(Some(args.as_main_args()), Some(&mut SalirApp::new()), std::ptr::null_mut());
+    (!is_browser).then_some(code)
+}
+
+/// CEF started, its data (cache, cookies) in `cache`.
+pub fn start(cache: &std::path::Path) -> bool {
+    let args = args::Args::new();
+    let settings = Settings {
+        windowless_rendering_enabled: 1,
+        external_message_pump: 1,
+        no_sandbox: 1,
+        root_cache_path: cache.to_string_lossy().as_ref().into(),
+        log_severity: if std::env::var_os("SALIR_LOG").is_some() { LogSeverity::INFO } else { LogSeverity::ERROR },
+        ..Default::default()
+    };
+    initialize(Some(args.as_main_args()), Some(&settings), Some(&mut SalirApp::new()), std::ptr::null_mut()) == 1
+}
+
+/// CEF's work since last asked (when it asked for it: app::schedule_pump).
+pub fn work() {
+    do_message_loop_work();
+}
+
+pub fn shutdown() {
+    cef::shutdown();
+}
+
+wrap_app! {
+    struct SalirApp;
+
+    impl App {
+        fn on_before_command_line_processing(&self, _process_type: Option<&CefStringUtf16>, command_line: Option<&mut CommandLine>) {
+            let Some(command_line) = command_line else { return };
+            for switch in ["no-startup-window", "noerrdialogs", "hide-crash-restore-bubble", "disable-session-crashed-bubble"] {
+                command_line.append_switch(Some(&switch.into()));
+            }
+            // SALIR_CHROMIUM_FLAGS="name=value name": Chromium's own switches, passed on.
+            for switch in std::env::var("SALIR_CHROMIUM_FLAGS").unwrap_or_default().split_whitespace() {
+                let switch = switch.trim_start_matches('-');
+                match switch.split_once('=') {
+                    Some((name, value)) => command_line.append_switch_with_value(Some(&name.into()), Some(&value.into())),
+                    None => command_line.append_switch(Some(&switch.into())),
+                }
+            }
+        }
+
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(Pump::new())
+        }
+
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(Bridge::new())
+        }
+    }
+}
+
+wrap_browser_process_handler! {
+    struct Pump;
+
+    impl BrowserProcessHandler {
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            crate::app::schedule_pump(delay_ms);
+        }
+    }
+}
+
+// In a page's process: window.salir, its native half a function that sends a process message.
+wrap_render_process_handler! {
+    struct Bridge;
+
+    impl RenderProcessHandler {
+        fn on_context_created(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, context: Option<&mut V8Context>) {
+            let Some(context) = context else { return };
+            let Some(global) = context.global() else { return };
+            let Some(mut send) = v8_value_create_function(Some(&"__salirSend".into()), Some(&mut SendFn::new())) else { return };
+            global.set_value_bykey(Some(&"__salirSend".into()), Some(&mut send), V8Propertyattribute::default());
+            let (mut retval, mut exception) = (None, None);
+            context.eval(Some(&BRIDGE.into()), Some(&"salir://bridge.js".into()), 1, Some(&mut retval), Some(&mut exception));
+        }
+    }
+}
+
+wrap_v8_handler! {
+    struct SendFn;
+
+    impl V8Handler {
+        fn execute(&self, _name: Option<&CefString>, _object: Option<&mut V8Value>, arguments: Option<&[Option<V8Value>]>, _retval: Option<&mut Option<V8Value>>, _exception: Option<&mut CefString>) -> ::std::os::raw::c_int {
+            let Some(text) = arguments.and_then(|a| a.first()).and_then(|a| a.as_ref()).map(|v| CefString::from(&v.string_value()).to_string()) else { return 0 };
+            let Some(frame) = v8_context_get_current_context().and_then(|c| c.frame()) else { return 0 };
+            let Some(mut message) = process_message_create(Some(&MESSAGE.into())) else { return 0 };
+            if let Some(args) = message.argument_list() {
+                args.set_string(0, Some(&text.as_str().into()));
+            }
+            frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
+            1
+        }
+    }
+}
+
+/// What a window and its page share (all on the main thread: CEF's callbacks come
+/// from work(), called there).
+#[derive(Default)]
+pub struct PageState {
+    /// The page's size, in CSS pixels, and pixels to one of those.
+    pub size: (i32, i32),
+    pub scale: f32,
+    /// What the page sent (window.salir), not yet seen to.
+    pub messages: Vec<Value>,
+    pub title: Option<String>,
+    pub cursor: Option<CursorIcon>,
+    /// window.open()'s and target=_blank's addresses (not opened: the app's to).
+    pub popups: Vec<String>,
+    /// Its last frame, our copy; and its popup's (a <select>'s list), where it is (CSS pixels).
+    pub page: Option<(wgpu::Texture, Layer)>,
+    pub popup: Option<(wgpu::Texture, Layer)>,
+    pub popup_rect: Option<[i32; 4]>,
+    /// Drawn again since last shown.
+    pub painted: bool,
+    pub closed: bool,
+    /// Why a frame couldn't be shared (once).
+    pub error: Option<String>,
+    /// CEF's buffers, as imported (it draws into a few, in turn): by the dmabuf's identity.
+    pub(crate) imported: HashMap<u64, Layer>,
+}
+
+impl PageState {
+    /// Resized: CEF's buffers are new ones now.
+    pub fn resized(&mut self) {
+        self.imported.clear();
+    }
+
+    // Our copy of a frame (the page's, or its popup's), `width`×`height`.
+    fn target(&mut self, gpu: &Gpu, popup: bool, width: u32, height: u32) -> &wgpu::Texture {
+        let slot = if popup { &mut self.popup } else { &mut self.page };
+        if slot.as_ref().is_none_or(|(t, _)| (t.width(), t.height()) != (width, height)) {
+            let texture = gpu.target(width, height, PAGE_FORMAT);
+            let layer = gpu.layer(&texture.create_view(&Default::default()));
+            *slot = Some((texture, layer));
+        }
+        &slot.as_ref().unwrap().0
+    }
+}
+
+#[derive(Clone)]
+pub struct Shared {
+    pub state: Rc<RefCell<PageState>>,
+    pub gpu: Rc<Gpu>,
+}
+
+wrap_render_handler! {
+    struct Renderer {
+        shared: Shared,
+    }
+
+    impl RenderHandler {
+        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+            if let Some(rect) = rect {
+                let (w, h) = self.shared.state.borrow().size;
+                rect.width = w.max(1);
+                rect.height = h.max(1);
+            }
+        }
+
+        fn screen_info(&self, _browser: Option<&mut Browser>, screen_info: Option<&mut ScreenInfo>) -> ::std::os::raw::c_int {
+            let Some(screen_info) = screen_info else { return 0 };
+            screen_info.device_scale_factor = self.shared.state.borrow().scale;
+            1
+        }
+
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: ::std::os::raw::c_int) {
+            trace!("popup {}", if show != 0 { "shown" } else { "hidden" });
+            if show == 0 {
+                let mut state = self.shared.state.borrow_mut();
+                state.popup_rect = None;
+                state.popup = None;
+                state.painted = true;
+            }
+        }
+
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            if let Some(r) = rect {
+                trace!("popup at {} {}, {}×{}", r.x, r.y, r.width, r.height);
+                self.shared.state.borrow_mut().popup_rect = Some([r.x, r.y, r.width, r.height]);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn on_accelerated_paint(&self, _browser: Option<&mut Browser>, type_: PaintElementType, _dirty_rects: Option<&[Rect]>, info: Option<&AcceleratedPaintInfo>) {
+            use crate::dmabuf::{self, Dmabuf};
+            let Some(info) = info else { return };
+            let plane = &info.planes[0];
+            let Some(key) = dmabuf::identity(plane.fd) else { return };
+            let (width, height) = (info.extra.coded_size.width as u32, info.extra.coded_size.height as u32);
+            let gpu = &self.shared.gpu;
+            let mut state = self.shared.state.borrow_mut();
+            if let std::collections::hash_map::Entry::Vacant(slot) = state.imported.entry(key) {
+                let format = if info.format == ColorType::RGBA_8888 { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::Bgra8Unorm };
+                match dmabuf::import(&gpu.device, &Dmabuf { fd: plane.fd, width, height, stride: plane.stride, offset: plane.offset as u32, modifier: info.modifier, format }) {
+                    Ok(texture) => {
+                        slot.insert(gpu.layer(&texture.create_view(&Default::default())));
+                    }
+                    Err(e) => {
+                        state.error.get_or_insert(e);
+                        return;
+                    }
+                }
+            }
+            let target = state.target(gpu, type_ == PaintElementType::POPUP, width, height).clone();
+            gpu.copy(&state.imported[&key], &target);
+            state.painted = true;
+            trace!("{} painted, shared: {width}×{height}", if type_ == PaintElementType::POPUP { "popup" } else { "page" });
+        }
+
+        fn on_paint(&self, _browser: Option<&mut Browser>, type_: PaintElementType, _dirty_rects: Option<&[Rect]>, buffer: *const u8, width: ::std::os::raw::c_int, height: ::std::os::raw::c_int) {
+            if buffer.is_null() || width <= 0 || height <= 0 {
+                return;
+            }
+            let (w, h) = (width as u32, height as u32);
+            let bgra = unsafe { std::slice::from_raw_parts(buffer, (w * h * 4) as usize) };
+            let gpu = &self.shared.gpu;
+            let mut state = self.shared.state.borrow_mut();
+            let target = state.target(gpu, type_ == PaintElementType::POPUP, w, h);
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bgra,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            state.painted = true;
+            trace!("page painted, through memory: {w}×{h}");
+        }
+    }
+}
+
+wrap_display_handler! {
+    struct Display {
+        shared: Shared,
+    }
+
+    impl DisplayHandler {
+        fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
+            self.shared.state.borrow_mut().title = title.map(|t| t.to_string());
+        }
+
+        fn on_cursor_change(&self, _browser: Option<&mut Browser>, _cursor: ::std::os::raw::c_ulong, type_: CursorType, _custom_cursor_info: Option<&CursorInfo>) -> ::std::os::raw::c_int {
+            self.shared.state.borrow_mut().cursor = Some(cursor_icon(type_));
+            1
+        }
+
+        fn on_console_message(&self, _browser: Option<&mut Browser>, _level: LogSeverity, message: Option<&CefString>, source: Option<&CefString>, line: ::std::os::raw::c_int) -> ::std::os::raw::c_int {
+            // SALIR_CONSOLE=1: pages' console, on stderr.
+            if std::env::var_os("SALIR_CONSOLE").is_some() {
+                eprintln!("console: {} ({}:{line})", message.map(|m| m.to_string()).unwrap_or_default(), source.map(|s| s.to_string()).unwrap_or_default());
+            }
+            1
+        }
+    }
+}
+
+wrap_life_span_handler! {
+    struct LifeSpan {
+        shared: Shared,
+    }
+
+    impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            self.shared.state.borrow_mut().popups.push(target_url.map(|u| u.to_string()).unwrap_or_default());
+            1 // (not opened)
+        }
+
+        fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            self.shared.state.borrow_mut().closed = true;
+        }
+    }
+}
+
+// No context menu of CEF's (it would need a window of its own): pages make their own.
+wrap_context_menu_handler! {
+    struct NoMenu;
+
+    impl ContextMenuHandler {
+        fn on_before_context_menu(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>) {
+            if let Some(model) = model {
+                model.clear();
+            }
+        }
+    }
+}
+
+wrap_client! {
+    struct SalirClient {
+        shared: Shared,
+        renderer: RenderHandler,
+        display: DisplayHandler,
+        life_span: LifeSpanHandler,
+        menu: ContextMenuHandler,
+    }
+
+    impl Client {
+        fn render_handler(&self) -> Option<RenderHandler> {
+            Some(self.renderer.clone())
+        }
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(self.display.clone())
+        }
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(self.life_span.clone())
+        }
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(self.menu.clone())
+        }
+
+        fn on_process_message_received(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _source_process: ProcessId, message: Option<&mut ProcessMessage>) -> ::std::os::raw::c_int {
+            let Some(message) = message else { return 0 };
+            if CefString::from(&message.name()).to_string() != MESSAGE {
+                return 0;
+            }
+            let Some(text) = message.argument_list().map(|a| CefString::from(&a.string(0)).to_string()) else { return 1 };
+            if let Ok(value) = serde_json::from_str(&text) {
+                self.shared.state.borrow_mut().messages.push(value);
+            }
+            1
+        }
+    }
+}
+
+/// A page: a browser drawing off screen, and what's done to it.
+pub struct Page {
+    browser: Browser,
+}
+
+impl Page {
+    /// A page at `url`; its frames handed over on the GPU where salir can take them so.
+    pub fn open(shared: &Shared, url: &str) -> Option<Page> {
+        let window_info = WindowInfo {
+            windowless_rendering_enabled: 1,
+            shared_texture_enabled: cfg!(target_os = "linux") as _,
+            ..Default::default()
+        };
+        let settings = BrowserSettings {
+            windowless_frame_rate: 60,
+            background_color: 0, // (see-through where the page is: embeds show there)
+            ..Default::default()
+        };
+        let mut client = SalirClient::new(shared.clone(), Renderer::new(shared.clone()), Display::new(shared.clone()), LifeSpan::new(shared.clone()), NoMenu::new());
+        browser_host_create_browser_sync(Some(&window_info), Some(&mut client), Some(&url.into()), Some(&settings), None, None).map(|browser| Page { browser })
+    }
+
+    fn host(&self) -> Option<BrowserHost> {
+        self.browser.host()
+    }
+
+    /// Runs `code` in the page.
+    pub fn run(&self, code: &str) {
+        if let Some(frame) = self.browser.main_frame() {
+            frame.execute_java_script(Some(&code.into()), None, 0);
+        }
+    }
+
+    /// To the page's window.salir (its _receive).
+    pub fn deliver(&self, message: &Value) {
+        self.run(&format!("window.salir && salir._receive({message})"));
+    }
+
+    pub fn resized(&self) {
+        if let Some(h) = self.host() {
+            h.was_resized();
+        }
+    }
+
+    pub fn screen_changed(&self) {
+        if let Some(h) = self.host() {
+            h.notify_screen_info_changed();
+        }
+    }
+
+    pub fn focus(&self, focused: bool) {
+        if let Some(h) = self.host() {
+            h.set_focus(focused as _);
+        }
+    }
+
+    /// Closed (its unload handlers run first): PageState.closed once it is.
+    pub fn close(&self) {
+        if let Some(h) = self.host() {
+            h.close_browser(0);
+        }
+    }
+
+    pub fn mouse_move(&self, x: i32, y: i32, flags: u32, leave: bool) {
+        if let Some(h) = self.host() {
+            h.send_mouse_move_event(Some(&MouseEvent { x, y, modifiers: flags }), leave as _);
+        }
+    }
+
+    /// `button`: 0 left, 1 middle, 2 right.
+    pub fn mouse_button(&self, x: i32, y: i32, flags: u32, button: u8, up: bool, clicks: i32) {
+        let button = match button {
+            1 => MouseButtonType::MIDDLE,
+            2 => MouseButtonType::RIGHT,
+            _ => MouseButtonType::LEFT,
+        };
+        if let Some(h) = self.host() {
+            h.send_mouse_click_event(Some(&MouseEvent { x, y, modifiers: flags }), button, up as _, clicks);
+        }
+    }
+
+    pub fn wheel(&self, x: i32, y: i32, flags: u32, dx: i32, dy: i32) {
+        if let Some(h) = self.host() {
+            h.send_mouse_wheel_event(Some(&MouseEvent { x, y, modifiers: flags }), dx, dy);
+        }
+    }
+
+    /// A key down or up: its Windows key code (keys.rs) and the system's.
+    pub fn key(&self, down: bool, windows_code: i32, native_code: i32, flags: u32) {
+        let event = KeyEvent {
+            size: std::mem::size_of::<KeyEvent>(),
+            type_: if down { KeyEventType::RAWKEYDOWN } else { KeyEventType::KEYUP },
+            modifiers: flags,
+            windows_key_code: windows_code,
+            native_key_code: native_code,
+            ..Default::default()
+        };
+        if let Some(h) = self.host() {
+            h.send_key_event(Some(&event));
+        }
+    }
+
+    /// A character typed as a key does (Enter's: a new line in a text area).
+    pub fn char(&self, code: u16, windows_code: i32, flags: u32) {
+        let event = KeyEvent { size: std::mem::size_of::<KeyEvent>(), type_: KeyEventType::CHAR, modifiers: flags, windows_key_code: windows_code, character: code, unmodified_character: code, ..Default::default() };
+        if let Some(h) = self.host() {
+            h.send_key_event(Some(&event));
+        }
+    }
+
+    /// Text typed. (As text, not as keys: CEF on Linux would make each character from a
+    /// key's Windows code, US style; this way any text comes through: é, þ, 字.)
+    pub fn text(&self, text: &str) {
+        if let Some(h) = self.host() {
+            h.ime_commit_text(Some(&text.into()), Some(&Range { from: u32::MAX, to: u32::MAX }), 0);
+        }
+    }
+}
+
+/// CEF's event flags.
+pub mod flags {
+    pub const SHIFT: u32 = 1 << 1;
+    pub const CONTROL: u32 = 1 << 2;
+    pub const ALT: u32 = 1 << 3;
+    pub const LEFT: u32 = 1 << 4;
+    pub const MIDDLE: u32 = 1 << 5;
+    pub const RIGHT: u32 = 1 << 6;
+    pub const META: u32 = 1 << 7; // (EVENTFLAG_COMMAND_DOWN)
+}
+
+fn cursor_icon(t: CursorType) -> CursorIcon {
+    match t {
+        CursorType::HAND => CursorIcon::Pointer,
+        CursorType::IBEAM => CursorIcon::Text,
+        CursorType::VERTICALTEXT => CursorIcon::VerticalText,
+        CursorType::CROSS => CursorIcon::Crosshair,
+        CursorType::WAIT => CursorIcon::Wait,
+        CursorType::PROGRESS => CursorIcon::Progress,
+        CursorType::HELP => CursorIcon::Help,
+        CursorType::MOVE => CursorIcon::Move,
+        CursorType::CELL => CursorIcon::Cell,
+        CursorType::CONTEXTMENU => CursorIcon::ContextMenu,
+        CursorType::ALIAS => CursorIcon::Alias,
+        CursorType::COPY => CursorIcon::Copy,
+        CursorType::NODROP | CursorType::NOTALLOWED => CursorIcon::NotAllowed,
+        CursorType::GRAB => CursorIcon::Grab,
+        CursorType::GRABBING => CursorIcon::Grabbing,
+        CursorType::ZOOMIN => CursorIcon::ZoomIn,
+        CursorType::ZOOMOUT => CursorIcon::ZoomOut,
+        CursorType::EASTRESIZE => CursorIcon::EResize,
+        CursorType::WESTRESIZE => CursorIcon::WResize,
+        CursorType::NORTHRESIZE => CursorIcon::NResize,
+        CursorType::SOUTHRESIZE => CursorIcon::SResize,
+        CursorType::NORTHEASTRESIZE => CursorIcon::NeResize,
+        CursorType::NORTHWESTRESIZE => CursorIcon::NwResize,
+        CursorType::SOUTHEASTRESIZE => CursorIcon::SeResize,
+        CursorType::SOUTHWESTRESIZE => CursorIcon::SwResize,
+        CursorType::EASTWESTRESIZE => CursorIcon::EwResize,
+        CursorType::NORTHSOUTHRESIZE => CursorIcon::NsResize,
+        CursorType::NORTHEASTSOUTHWESTRESIZE => CursorIcon::NeswResize,
+        CursorType::NORTHWESTSOUTHEASTRESIZE => CursorIcon::NwseResize,
+        CursorType::COLUMNRESIZE => CursorIcon::ColResize,
+        CursorType::ROWRESIZE => CursorIcon::RowResize,
+        CursorType::MIDDLEPANNING => CursorIcon::AllScroll,
+        _ => CursorIcon::Default,
+    }
+}
