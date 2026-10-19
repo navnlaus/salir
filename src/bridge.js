@@ -79,6 +79,22 @@
     close() {
       post({ $: "close" });
     },
+    // Local files as File objects (`paths`: absolute): to read, or to drag out to other
+    // programs as files (dataTransfer.items.add). Only where the app allows it (its own page),
+    // and in an input event's handler (a file dialog's rule: pointerdown, keydown...).
+    files(paths) {
+      return new Promise((resolve, reject) => {
+        const token = Math.random().toString(36).slice(2);
+        const input = document.createElement("input");
+        input.type = "file";
+        input.multiple = true;
+        input.accept = ".salir-files-" + token;
+        input.addEventListener("change", () => resolve([...input.files]), { once: true });
+        input.addEventListener("cancel", () => reject(new Error("salir.files: not given")), { once: true });
+        post({ $: "files", token, paths: [...paths] });
+        input.click();
+      });
+    },
     embed(element, kind, options = {}) {
       if (!top) throw new Error("salir.embed: in the top frame only");
       const id = nextId++;

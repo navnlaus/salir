@@ -248,7 +248,7 @@ impl App {
             let shared = Shared { state: Rc::new(RefCell::new(PageState { size: (options.width as i32, options.height as i32), scale: 1.0, ..Default::default() })), gpu: self.gpu.clone() };
             let argb = (((a * 255.0) as u32) << 24) | (((r * 255.0) as u32) << 16) | (((g * 255.0) as u32) << 8) | ((b * 255.0) as u32);
             let direct = browser::DirectWindow { title: options.title.clone().or_else(|| options.initial_title.clone()), width: options.width as i32, height: options.height as i32, app_id: options.app_id.clone() };
-            let page = Page::open(&shared, &options.url, Some(direct), argb);
+            let page = Page::open(&shared, &options.url, Some(direct), argb, options.files);
             (None, shared, page)
         } else {
             let mut attributes = Window::default_attributes().with_title(options.title.clone().or_else(|| options.initial_title.clone()).unwrap_or_else(|| "salir".into())).with_inner_size(winit::dpi::LogicalSize::new(options.width, options.height)).with_transparent(a < 1.0);
@@ -269,7 +269,7 @@ impl App {
             let scale = window.scale_factor();
             let logical = size.to_logical::<f64>(scale);
             let shared = Shared { state: Rc::new(RefCell::new(PageState { size: (logical.width as i32, logical.height as i32), scale: scale as f32, ..Default::default() })), gpu: self.gpu.clone() };
-            let page = Page::open(&shared, &options.url, None, 0);
+            let page = Page::open(&shared, &options.url, None, 0, options.files);
             (Some(surface), shared, page)
         };
         if page.is_none() {

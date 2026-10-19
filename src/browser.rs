@@ -209,6 +209,10 @@ pub struct PageState {
     pub(crate) imported: HashMap<u64, Layer>,
     /// A direct page's window (CEF's own), once made.
     pub(crate) window: Option<Window>,
+    /// salir.files(): the paths asked for, by token, till the page's file dialog for them comes;
+    /// a dialog that came first, waiting for them (the two come by different ways).
+    pub(crate) files: HashMap<String, Vec<String>>,
+    pub(crate) file_dialogs: HashMap<String, FileDialogCallback>,
 }
 
 impl PageState {
@@ -399,6 +403,52 @@ wrap_request_handler! {
     }
 }
 
+// salir.files(paths): the page's file dialog (bridge.js: an <input type=file>, its accept a token)
+// answered with those paths, unseen: the page has them as File objects (readable by it, and
+// dragged out as files), as if picked. Other dialogs: CEF's.
+const FILES_TOKEN: &str = ".salir-files-";
+
+wrap_dialog_handler! {
+    struct Dialogs {
+        shared: Shared,
+    }
+
+    impl DialogHandler {
+        fn on_file_dialog(&self, _browser: Option<&mut Browser>, _mode: FileDialogMode, _title: Option<&CefString>, _default_file_path: Option<&CefString>, accept_filters: Option<&mut CefStringList>, _accept_extensions: Option<&mut CefStringList>, _accept_descriptions: Option<&mut CefStringList>, callback: Option<&mut FileDialogCallback>) -> ::std::os::raw::c_int {
+            let filters: Vec<String> = accept_filters.map(|l| CefStringList::from(<*mut cef::sys::_cef_string_list_t>::from(l)).into_iter().collect()).unwrap_or_default();
+            let Some(token) = filters.iter().find_map(|f| f.strip_prefix(FILES_TOKEN)) else { return 0 };
+            let Some(callback) = callback else { return 0 };
+            let mut s = self.shared.state.borrow_mut();
+            match s.files.remove(token) {
+                Some(paths) => give_files(callback, &paths),
+                None => {
+                    s.file_dialogs.insert(token.to_string(), callback.clone());
+                }
+            }
+            1
+        }
+    }
+}
+
+fn give_files(callback: &FileDialogCallback, paths: &[String]) {
+    if paths.is_empty() {
+        return callback.cancel();
+    }
+    let mut list = CefStringList::new();
+    for p in paths {
+        list.append(p);
+    }
+    callback.cont(Some(&mut list));
+}
+
+// "scheme://host:port" of a URL (the part a page's origin is).
+fn origin(url: &str) -> &str {
+    match url.find("://") {
+        Some(i) => &url[..url[i + 3..].find('/').map_or(url.len(), |j| i + 3 + j)],
+        None => url,
+    }
+}
+
 // No context menu of CEF's (it would need a window of its own): pages make their own.
 wrap_context_menu_handler! {
     struct NoMenu;
@@ -420,6 +470,8 @@ wrap_client! {
         life_span: LifeSpanHandler,
         menu: ContextMenuHandler,
         requests: RequestHandler,
+        dialogs: DialogHandler,
+        files_origin: Option<String>, // salir.files() allowed (WindowOptions::files): from this origin's top frame
     }
 
     impl Client {
@@ -438,16 +490,33 @@ wrap_client! {
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.requests.clone())
         }
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(self.dialogs.clone())
+        }
 
-        fn on_process_message_received(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _source_process: ProcessId, message: Option<&mut ProcessMessage>) -> ::std::os::raw::c_int {
+        fn on_process_message_received(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _source_process: ProcessId, message: Option<&mut ProcessMessage>) -> ::std::os::raw::c_int {
             let Some(message) = message else { return 0 };
             if CefString::from(&message.name()).to_string() != MESSAGE {
                 return 0;
             }
             let Some(text) = message.argument_list().map(|a| CefString::from(&a.string(0)).to_string()) else { return 1 };
-            if let Ok(value) = serde_json::from_str(&text) {
-                self.shared.state.borrow_mut().messages.push(value);
+            let Ok(value) = serde_json::from_str::<Value>(&text) else { return 1 };
+            if value.get("$").and_then(Value::as_str) == Some("files") {
+                // salir.files(): its own page's (top frame, its origin), if the window allows it.
+                let url = frame.as_ref().map(|f| CefString::from(&f.url()).to_string()).unwrap_or_default();
+                let allowed = self.files_origin.as_deref().is_some_and(|o| frame.as_ref().is_some_and(|f| f.is_main() == 1) && origin(&url) == o);
+                let token = value.get("token").and_then(Value::as_str).unwrap_or("").to_string();
+                let paths: Vec<String> = if allowed { value.get("paths").and_then(Value::as_array).map(|a| a.iter().filter_map(|p| p.as_str().map(str::to_owned)).collect()).unwrap_or_default() } else { vec![] };
+                let mut s = self.shared.state.borrow_mut();
+                match s.file_dialogs.remove(&token) {
+                    Some(callback) => give_files(&callback, &paths),
+                    None => {
+                        s.files.insert(token, paths);
+                    }
+                }
+                return 1;
             }
+            self.shared.state.borrow_mut().messages.push(value);
             1
         }
     }
@@ -473,14 +542,15 @@ pub struct Page {
 impl Page {
     /// A page at `url`; off screen, its frames handed over on the GPU where salir can take
     /// them so; or, `direct`, in a window of its own. `background`: ARGB, under the page.
-    pub fn open(shared: &Shared, url: &str, direct: Option<DirectWindow>, background: u32) -> Option<Page> {
+    pub fn open(shared: &Shared, url: &str, direct: Option<DirectWindow>, background: u32, files: bool) -> Option<Page> {
         let settings = BrowserSettings {
             windowless_frame_rate: 60,
             background_color: if direct.is_some() { background } else { 0 }, // (off screen: see-through where the page is, embeds show there)
             ..Default::default()
         };
         let renderer = direct.is_none().then(|| Renderer::new(shared.clone()));
-        let mut client = SalirClient::new(shared.clone(), renderer, Display::new(shared.clone()), LifeSpan::new(shared.clone()), NoMenu::new(), Requests::new());
+        let files_origin = files.then(|| origin(url).to_string());
+        let mut client = SalirClient::new(shared.clone(), renderer, Display::new(shared.clone()), LifeSpan::new(shared.clone()), NoMenu::new(), Requests::new(), Dialogs::new(shared.clone()), files_origin);
         if let Some(direct) = direct {
             let view = browser_view_create(Some(&mut client), Some(&url.into()), Some(&settings), None, None, Some(&mut PlainView::new()))?;
             window_create_top_level(Some(&mut DirectDelegate::new(view.clone(), shared.clone(), direct.title, direct.width, direct.height, direct.app_id)))?;

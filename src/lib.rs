@@ -52,11 +52,15 @@ pub struct WindowOptions {
     /// The page in a window of its own, drawn and shown by Chromium: no compositing (no extra
     /// frame of latency), no embeds. For pages that are all there is: a game in WebGPU, an app's UI.
     pub direct: bool,
+    /// Its page may have local files as File objects (salir.files(paths)): to drag them out to
+    /// other programs, say. Its own page alone (the top frame, the window's origin): it gets to
+    /// read them, so only for an app's own pages, never a web page.
+    pub files: bool,
 }
 
 impl WindowOptions {
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> WindowOptions {
-        WindowOptions { id: id.into(), url: url.into(), title: None, initial_title: None, width: 1280, height: 800, app_id: None, background: [0.0, 0.0, 0.0, 1.0], direct: false }
+        WindowOptions { id: id.into(), url: url.into(), title: None, initial_title: None, width: 1280, height: 800, app_id: None, background: [0.0, 0.0, 0.0, 1.0], direct: false, files: false }
     }
 }
 

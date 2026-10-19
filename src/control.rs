@@ -61,6 +61,7 @@ fn parse(v: &Value) -> Result<Command, String> {
             w.height = n as u32;
         }
         w.direct = o.get("direct").and_then(Value::as_bool).unwrap_or(false);
+        w.files = o.get("files").and_then(Value::as_bool).unwrap_or(false);
         if let Some(b) = o.get("background").and_then(|b| serde_json::from_value::<[f64; 4]>(b.clone()).ok()) {
             w.background = b;
         }

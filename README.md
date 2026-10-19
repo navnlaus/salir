@@ -100,7 +100,18 @@ And messages with the app:
 salir.send({ any: "JSON" });              // to the app (--control: stdout)
 salir.on((message) => …);                 // from it
 salir.close();                            // the page's window closed: off the screen at once, its unload handlers after
+await salir.files(["/home/me/a.pdf"]);    // local files as File objects (where the app allows it, below)
 ```
+
+`salir.files(paths)` gives the page `File` objects for local files, as if picked
+in its file dialog (which salir answers itself, unseen): to read them, or to
+drag them out of the window to other programs as files
+(`dataTransfer.items.add(file)` in `dragstart`: a browser's upload, a file
+manager). A page's own `file://` URIs don't do: Chromium blanks them as a drag
+leaves the page. Only in a window that allows it (`WindowOptions::files`, `"files":
+true` over `--control`), from its own page (the top frame, the window's origin),
+and in an input event's handler (a file dialog's rule: `pointerdown`, `keydown`…);
+the page can read them, so it's for an app's own pages, never a web page.
 
 ### Embeds
 
@@ -147,7 +158,7 @@ driven by JSON as mpv's own nodes.
 JSON lines, commands on stdin, events on stdout (`src/control.rs`):
 
 ```
-→ {"open": {"id": "w1", "url": "…", "title"?, "initial_title"?, "width"?, "height"?, "app_id"?, "background"?: [r, g, b, a], "direct"?: true}}
+→ {"open": {"id": "w1", "url": "…", "title"?, "initial_title"?, "width"?, "height"?, "app_id"?, "background"?: [r, g, b, a], "direct"?: true, "files"?: true}}
                        (initial_title: the title till the page sets its own: a window rule's to match)
 → {"send": {"window": "w1", "message": …}}        (salir.on in the page)
 → {"close": "w1"}      → {"quit": true}             (or stdin closed)
