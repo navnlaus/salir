@@ -335,7 +335,11 @@ wrap_display_handler! {
         }
 
         fn on_cursor_change(&self, _browser: Option<&mut Browser>, _cursor: ::std::os::raw::c_ulong, type_: CursorType, _custom_cursor_info: Option<&CursorInfo>) -> ::std::os::raw::c_int {
-            self.shared.state.borrow_mut().cursor = Some(cursor_icon(type_));
+            let mut state = self.shared.state.borrow_mut();
+            if state.window.is_some() {
+                return 0; // (a direct page's window: Chromium's, which sets its cursor itself)
+            }
+            state.cursor = Some(cursor_icon(type_));
             1
         }
 
@@ -753,12 +757,21 @@ wrap_window_delegate! {
 
         fn linux_window_properties(&self, _window: Option<&mut Window>, properties: Option<&mut LinuxWindowProperties>) -> ::std::os::raw::c_int {
             let (Some(app_id), Some(p)) = (&self.app_id, properties) else { return 0 };
-            p.wayland_app_id = app_id.as_str().into();
-            p.wm_class_class = app_id.as_str().into();
-            p.wm_class_name = app_id.as_str().into();
+            p.wayland_app_id = lasting_string(app_id);
+            p.wm_class_class = lasting_string(app_id);
+            p.wm_class_name = lasting_string(app_id);
             1
         }
     }
+}
+
+// A string for CEF to read in a struct salir fills in (an out-parameter): one cef-rs owns comes out
+// empty there (its conversion to CEF's keeps only strings it borrows), so this one's CEF's own
+// kind, borrowed, over UTF-16 that lasts (a few bytes, once per window: CEF copies it).
+fn lasting_string(s: &str) -> CefString {
+    let utf16: &'static [u16] = Box::leak(s.encode_utf16().collect::<Vec<u16>>().into_boxed_slice());
+    let raw = cef::sys::_cef_string_utf16_t { str_: utf16.as_ptr() as *mut u16, length: utf16.len(), dtor: None };
+    CefString::from(&raw as *const cef::sys::_cef_string_utf16_t)
 }
 
 /// CEF's event flags.
