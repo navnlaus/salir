@@ -60,6 +60,7 @@ impl WindowOptions {
 /// An app: its windows, embeds and plugins; run() runs it.
 pub struct Salir {
     name: String,
+    data: Option<PathBuf>,
     windows: Vec<WindowOptions>,
     embeds: HashMap<String, embed::EmbedFactory>,
     gl_embeds: HashMap<String, embed::GlEmbedFactory>,
@@ -73,7 +74,22 @@ type OnMessage = Box<dyn FnMut(&str, Value)>;
 impl Salir {
     /// `name`: its data's folder's (~/.cache/<name>: CEF's cache, cookies, storage).
     pub fn new(name: impl Into<String>) -> Salir {
-        Salir { name: name.into(), windows: vec![], embeds: HashMap::new(), gl_embeds: HashMap::new(), plugins: vec![], control: false, on_message: None }
+        Salir { name: name.into(), data: None, windows: vec![], embeds: HashMap::new(), gl_embeds: HashMap::new(), plugins: vec![], control: false, on_message: None }
+    }
+
+    /// Its data (CEF's profile: cache, cookies, storage) in `dir`, not ~/.cache/<name>.
+    pub fn data(mut self, dir: impl Into<PathBuf>) -> Salir {
+        self.data = Some(dir.into());
+        self
+    }
+
+    /// `pem` (a certificate) trusted whatever its errors: an app's own server's, made for the
+    /// run (HTTPS on 127.0.0.1, for HTTP/2). Exactly it: any other's errors refuse it, as ever.
+    pub fn trust_certificate(self, pem: &str) -> Salir {
+        if let Err(e) = browser::trust_certificate(pem) {
+            eprintln!("salir: a certificate to trust: {e}");
+        }
+        self
     }
 
     pub fn window(mut self, options: WindowOptions) -> Salir {

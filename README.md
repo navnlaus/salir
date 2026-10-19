@@ -55,7 +55,9 @@ salir --control                              # driven by another program (below)
 ```
 
 Options: `--title`, `--size WxH`, `--app-id ID` (Wayland's, for window rules),
-`--name NAME` (its data: `~/.cache/NAME`).
+`--name NAME` (its data: `~/.cache/NAME`), `--data DIR` (its data anywhere),
+`--trust-certificate FILE` (a certificate, PEM, whose errors are let through:
+that one alone — an app's own server's, for HTTPS on 127.0.0.1, say).
 
 ### In the page
 
@@ -97,6 +99,7 @@ And messages with the app:
 ```js
 salir.send({ any: "JSON" });              // to the app (--control: stdout)
 salir.on((message) => …);                 // from it
+salir.close();                            // the page's window closed (its unload handlers run)
 ```
 
 ### Embeds
@@ -139,6 +142,7 @@ JSON lines, commands on stdin, events on stdout (`src/control.rs`):
 → {"open": {"id": "w1", "url": "…", "title"?, "width"?, "height"?, "app_id"?, "background"?: [r, g, b, a], "direct"?: true}}
 → {"send": {"window": "w1", "message": …}}        (salir.on in the page)
 → {"close": "w1"}      → {"quit": true}             (or stdin closed)
+→ {"trust_certificate": "-----BEGIN CERTIFICATE-----…"}   (as --trust-certificate)
 ← {"ready": true}  {"opened": "w1"}  {"closed": "w1"}  {"error": "…"}
 ← {"message": {"window": "w1", "message": …}}       (salir.send in the page)
 ← {"popup": {"window": "w1", "url": "…"}}           (window.open, target=_blank: not opened)

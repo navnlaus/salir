@@ -8,6 +8,8 @@
 //!   --size WxH           in CSS pixels (1280x800)
 //!   --app-id ID          its Wayland app id, for window rules
 //!   --name NAME          its data's folder: ~/.cache/NAME (salir)
+//!   --data DIR           its data's folder, any (CEF's profile: cache, cookies, storage)
+//!   --trust-certificate FILE   a certificate (PEM) whose errors are let through: that one alone
 
 use salir::{Salir, WindowOptions};
 use std::process::ExitCode;
@@ -19,6 +21,15 @@ fn main() -> ExitCode {
         return Salir::new("salir").run();
     }
     let mut salir = Salir::new(value(&args, "--name").unwrap_or("salir"));
+    if let Some(dir) = value(&args, "--data") {
+        salir = salir.data(dir);
+    }
+    if let Some(file) = value(&args, "--trust-certificate") {
+        match std::fs::read_to_string(file) {
+            Ok(pem) => salir = salir.trust_certificate(&pem),
+            Err(e) => return usage(&format!("--trust-certificate {file}: {e}")),
+        }
+    }
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--plugin" {
@@ -31,7 +42,7 @@ fn main() -> ExitCode {
         i += 1;
     }
     let control = args.iter().any(|a| a == "--control");
-    let url = args.iter().enumerate().filter(|(i, a)| !a.starts_with("--") && !(*i > 0 && ["--plugin", "--title", "--size", "--app-id", "--name"].contains(&args[i - 1].as_str()))).map(|(_, a)| a).next_back();
+    let url = args.iter().enumerate().filter(|(i, a)| !a.starts_with("--") && !(*i > 0 && ["--plugin", "--title", "--size", "--app-id", "--name", "--data", "--trust-certificate"].contains(&args[i - 1].as_str()))).map(|(_, a)| a).next_back();
     match url {
         Some(url) => {
             let mut w = WindowOptions::new("main", to_url(url));
@@ -65,6 +76,6 @@ fn to_url(s: &str) -> String {
 }
 
 fn usage(what: &str) -> ExitCode {
-    eprintln!("salir: {what}\nusage: salir [--plugin KIND=PATH]... [--control] [--direct] [--title T] [--size WxH] [--app-id ID] [--name NAME] [URL or file]");
+    eprintln!("salir: {what}\nusage: salir [--plugin KIND=PATH]... [--control] [--direct] [--title T] [--size WxH] [--app-id ID] [--name NAME] [--data DIR] [--trust-certificate FILE] [URL or file]");
     ExitCode::from(2)
 }

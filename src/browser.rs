@@ -13,6 +13,39 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use winit::window::CursorIcon;
 
 const BRIDGE: &str = include_str!("bridge.js");
+
+// Certificates trusted whatever their errors (an app's own server's, made for the run: its
+// HTTPS, for HTTP/2), as DER: exactly these, nothing else.
+static TRUSTED: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+/// `pem` (one certificate) trusted from now on, for this process's pages.
+pub fn trust_certificate(pem: &str) -> Result<(), String> {
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = base64(body.trim()).ok_or("not a PEM certificate")?;
+    let mut trusted = TRUSTED.lock().unwrap();
+    if !trusted.contains(&der) {
+        trusted.push(der);
+    }
+    Ok(())
+}
+
+fn base64(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let digits: Vec<u8> = text.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').map(value).collect::<Option<_>>()?;
+    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+    for chunk in digits.chunks(4) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, d)| n | (*d as u32) << (18 - 6 * i));
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    (!out.is_empty()).then_some(out)
+}
 const MESSAGE: &str = "salir";
 
 /// This process, if it's one of CEF's others (a page's, the GPU's...): run as
@@ -344,6 +377,28 @@ wrap_life_span_handler! {
     }
 }
 
+wrap_request_handler! {
+    struct Requests;
+
+    impl RequestHandler {
+        // A certificate error let through for a trusted certificate (trust_certificate), the very one.
+        fn on_certificate_error(&self, _browser: Option<&mut Browser>, _cert_error: Errorcode, _request_url: Option<&CefString>, ssl_info: Option<&mut Sslinfo>, callback: Option<&mut Callback>) -> ::std::os::raw::c_int {
+            let der = ssl_info.and_then(|i| i.x509_certificate()).and_then(|c| c.derencoded()).map(|b| {
+                let mut buf = vec![0u8; b.size()];
+                b.data(Some(&mut buf), 0);
+                buf
+            });
+            match (der, callback) {
+                (Some(der), Some(callback)) if TRUSTED.lock().unwrap().contains(&der) => {
+                    callback.cont();
+                    1
+                }
+                _ => 0, // (refused, as ever)
+            }
+        }
+    }
+}
+
 // No context menu of CEF's (it would need a window of its own): pages make their own.
 wrap_context_menu_handler! {
     struct NoMenu;
@@ -364,6 +419,7 @@ wrap_client! {
         display: DisplayHandler,
         life_span: LifeSpanHandler,
         menu: ContextMenuHandler,
+        requests: RequestHandler,
     }
 
     impl Client {
@@ -378,6 +434,9 @@ wrap_client! {
         }
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
             Some(self.menu.clone())
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.requests.clone())
         }
 
         fn on_process_message_received(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _source_process: ProcessId, message: Option<&mut ProcessMessage>) -> ::std::os::raw::c_int {
@@ -421,7 +480,7 @@ impl Page {
             ..Default::default()
         };
         let renderer = direct.is_none().then(|| Renderer::new(shared.clone()));
-        let mut client = SalirClient::new(shared.clone(), renderer, Display::new(shared.clone()), LifeSpan::new(shared.clone()), NoMenu::new());
+        let mut client = SalirClient::new(shared.clone(), renderer, Display::new(shared.clone()), LifeSpan::new(shared.clone()), NoMenu::new(), Requests::new());
         if let Some(direct) = direct {
             let view = browser_view_create(Some(&mut client), Some(&url.into()), Some(&settings), None, None, Some(&mut PlainView::new()))?;
             window_create_top_level(Some(&mut DirectDelegate::new(view.clone(), shared.clone(), direct.title, direct.width, direct.height, direct.app_id)))?;

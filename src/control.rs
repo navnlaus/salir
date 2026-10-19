@@ -20,6 +20,7 @@ use winit::event_loop::EventLoopProxy;
 
 pub enum Command {
     Open(WindowOptions),
+    Trust(String),
     Close(String),
     Send { window: String, message: Value },
     Quit,
@@ -63,6 +64,9 @@ fn parse(v: &Value) -> Result<Command, String> {
             w.background = b;
         }
         return Ok(Command::Open(w));
+    }
+    if let Some(pem) = v.get("trust_certificate").and_then(s) {
+        return Ok(Command::Trust(pem));
     }
     if let Some(id) = v.get("close").and_then(s) {
         return Ok(Command::Close(id));

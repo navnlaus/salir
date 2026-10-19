@@ -2,6 +2,7 @@
 //
 //   salir.send(message)                    to the app (--control: stdout; a Rust app: on_message)
 //   salir.on(fn)                           from it; returns a function that stops it
+//   salir.close()                          the page's window closed (its unload handlers run)
 //
 // Embeds, native content under the page where an element of it is, its size, as
 // it moves (followed every frame); the page shows it where it's see-through there
@@ -74,6 +75,9 @@
     on(fn) {
       listeners.add(fn);
       return () => listeners.delete(fn);
+    },
+    close() {
+      post({ $: "close" });
     },
     embed(element, kind, options = {}) {
       if (!top) throw new Error("salir.embed: in the top frame only");

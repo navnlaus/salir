@@ -75,7 +75,7 @@ pub fn run(salir: Salir) -> std::process::ExitCode {
     if let Some(code) = browser::subprocess() {
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
-    let cache = std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")).join(&salir.name);
+    let cache = salir.data.clone().unwrap_or_else(|| std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")).join(&salir.name));
     if !browser::start(&cache) {
         eprintln!("salir: CEF didn't start");
         return std::process::ExitCode::FAILURE;
@@ -311,6 +311,11 @@ impl App {
     fn command(&mut self, event_loop: &ActiveEventLoop, command: Command) {
         match command {
             Command::Open(options) => self.open(event_loop, options),
+            Command::Trust(pem) => {
+                if let Err(e) = browser::trust_certificate(&pem) {
+                    self.report(&format!("trust_certificate: {e}"));
+                }
+            }
             Command::Close(id) => match self.win_by_id(&id) {
                 Some(w) => close(w),
                 None => self.report(&format!("no window {id}")),
@@ -409,6 +414,12 @@ impl App {
                 }
                 if self.control {
                     control::emit(json!({ "message": { "window": window, "message": message } }));
+                }
+            }
+            "close" => {
+                // The page's window closed (salir.close()), as its close button would.
+                if let Some(w) = self.windows.get_mut(&key) {
+                    close(w);
                 }
             }
             "embed.create" => {
