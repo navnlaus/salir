@@ -417,8 +417,12 @@ impl App {
                 }
             }
             "close" => {
-                // The page's window closed (salir.close()), as its close button would.
+                // The page's window closed (salir.close()), as its close button would; off the
+                // screen at once (the page's decided: nothing to ask), the page closing unseen.
                 if let Some(w) = self.windows.get_mut(&key) {
+                    if !w.closing {
+                        w.surface = None;
+                    }
                     close(w);
                 }
             }
