@@ -76,6 +76,17 @@ wrap_app! {
             for switch in ["no-startup-window", "noerrdialogs", "hide-crash-restore-bubble", "disable-session-crashed-bubble", "disable-background-networking", "disable-component-update", "disable-domain-reliability", "disable-client-side-phishing-detection", "no-pings", "disable-sync"] {
                 command_line.append_switch(Some(&switch.into()));
             }
+            // Chrome's features that reach Google anyway: the Optimization Guide installs its
+            // on-device AI models' manifest (a component, on demand: --disable-component-update
+            // doesn't stop that); the clock checked against Google's; AI Mode's eligibility asked.
+            // Added to the features switched off already (CEF's): a second switch would replace them.
+            let off = ["OptimizationGuideManifestBroker", "OptimizationGuideModelExecution", "OptimizationHints", "OnDeviceModelBackgroundDownload", "NetworkTimeServiceQuerying", "AimServerEligibilityEnabled", "AimServerRequestOnStartupEnabled"];
+            let name: CefString = "disable-features".into();
+            let already = CefString::from(&command_line.switch_value(Some(&name))).to_string();
+            let all = already.split(',').filter(|f| !f.is_empty()).chain(off).collect::<Vec<_>>().join(",");
+            command_line.append_switch_with_value(Some(&name), Some(&all.as_str().into()));
+            // And whatever else asks the component updater for something: its server's nowhere.
+            command_line.append_switch_with_value(Some(&"component-updater".into()), Some(&"url-source=http://127.0.0.1:9/".into()));
             // SALIR_CHROMIUM_FLAGS="name=value name": Chromium's own switches, passed on.
             for switch in std::env::var("SALIR_CHROMIUM_FLAGS").unwrap_or_default().split_whitespace() {
                 let switch = switch.trim_start_matches('-');

@@ -167,5 +167,9 @@ window's keys directly, and giving them back. Not yet: resizing a window, a
 mouse moved by hand (the compositor has none), HiDPI, AMD and Intel GPUs,
 Windows, macOS, the clipboard. Not handled yet: drag and drop, JavaScript
 dialogs (`alert()`), file pickers, IME composition (typed text does go through).
-Chrome's background services (component updates, a time check) still reach
-Google despite the switches salir passes to stop them: to look into.
+Chrome's background services don't reach Google: no background networking,
+component updates, pings or sync (switches), the Optimization Guide's AI models,
+the network time check and AI Mode's eligibility switched off (features), and
+the component updater's server pointed at a closed local port, for anything that
+asks it anyway (its on-demand installs ignore `--disable-component-update`). In
+a fresh profile, 90 s: no request but those to that port; no socket opened.
