@@ -1,4 +1,4 @@
-/* salir's embeds in C: a plugin (a shared library) that draws with OpenGL into a
+/* salir's embeds in C (Linux only: EGL, dmabufs): a plugin (a shared library) that draws with OpenGL into a
  * part of a page, under it, where the page puts it: libmpv's render API, a game,
  * anything that draws with GL. Loaded with `salir --plugin NAME=path.so`; a page
  * makes one with salir.embed(element, "NAME", options).

@@ -96,13 +96,16 @@ salir::Salir::new("my-app")
     .run()
 ```
 
-`Embed::render` draws into a wgpu texture salir keeps for it; `GlEmbed::render`
+`Embed::render` draws into a wgpu texture salir keeps for it, on every system
+(wgpu: Vulkan, Direct3D 12, Metal). GL embeds and plugins are **Linux only** (EGL
+and dmabufs): for what only comes as OpenGL there, libmpv's render API above
+all. `GlEmbed::render`
 into a GL framebuffer (OpenGL 3.3 core, salir's EGL context, no window), which
 is shared with wgpu as a dmabuf. Either draws when made, resized, or asked to
 (`link.request_frame()` — from any thread: libmpv's update callback);
 `link.send()` talks to its page.
 
-In any language, a **plugin**: a shared library exporting `salir_plugin_v1`
+In any language (Linux), a **plugin**: a shared library exporting `salir_plugin_v1`
 (`include/salir.h`, installed with salir) — OpenGL, `create / render / message
 / destroy`, and the host's `get_proc_address / send / request_frame`.
 `examples/triangle/triangle.c` is one. libmpv's render API fits it as it is:
