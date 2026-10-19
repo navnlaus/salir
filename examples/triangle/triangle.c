@@ -40,6 +40,7 @@ struct gl {
   void (*UseProgram)(GLuint);
   GLint (*GetUniformLocation)(GLuint, const char *);
   void (*Uniform1f)(GLint, GLfloat);
+  void (*Uniform2f)(GLint, GLfloat, GLfloat);
   void (*GenVertexArrays)(int, GLuint *);
   void (*BindVertexArray)(GLuint);
   void (*DrawArrays)(GLenum, GLint, int);
@@ -51,7 +52,7 @@ struct triangle {
   const salir_host *host;
   struct gl gl;
   GLuint program, vao;
-  GLint angle_at;
+  GLint angle_at, scale_at;
   float angle, speed;
   long frames;
 };
@@ -59,10 +60,11 @@ struct triangle {
 static const char *VS =
     "#version 330 core\n"
     "uniform float angle;\n"
+    "uniform vec2 scale; /* (its own shape whatever the element's) */\n"
     "out vec3 colour;\n"
     "void main() {\n"
     "  float a = angle + float(gl_VertexID) * 2.0943951;\n"
-    "  gl_Position = vec4(0.8 * sin(a), 0.8 * cos(a), 0.0, 1.0);\n"
+    "  gl_Position = vec4(0.8 * vec2(sin(a), cos(a)) * scale, 0.0, 1.0);\n"
     "  colour = vec3(gl_VertexID == 0, gl_VertexID == 1, gl_VertexID == 2);\n"
     "}\n";
 static const char *FS =
@@ -95,7 +97,7 @@ static void *create(const salir_host *host, const char *options) {
 #define LOAD(name) *(void **)&t->gl.name = host->get_proc_address(host->ctx, "gl" #name)
   LOAD(BindFramebuffer); LOAD(Viewport); LOAD(ClearColor); LOAD(Clear); LOAD(Enable); LOAD(Disable);
   LOAD(Scissor); LOAD(CreateShader); LOAD(ShaderSource); LOAD(CompileShader); LOAD(CreateProgram);
-  LOAD(AttachShader); LOAD(LinkProgram); LOAD(UseProgram); LOAD(GetUniformLocation); LOAD(Uniform1f);
+  LOAD(AttachShader); LOAD(LinkProgram); LOAD(UseProgram); LOAD(GetUniformLocation); LOAD(Uniform1f); LOAD(Uniform2f);
   LOAD(GenVertexArrays); LOAD(BindVertexArray); LOAD(DrawArrays); LOAD(DeleteProgram); LOAD(DeleteVertexArrays);
   if (!t->gl.DrawArrays || !t->gl.GenVertexArrays) return free(t), NULL;
   t->program = t->gl.CreateProgram();
@@ -103,6 +105,7 @@ static void *create(const salir_host *host, const char *options) {
   t->gl.AttachShader(t->program, shader(&t->gl, GL_FRAGMENT_SHADER, FS));
   t->gl.LinkProgram(t->program);
   t->angle_at = t->gl.GetUniformLocation(t->program, "angle");
+  t->scale_at = t->gl.GetUniformLocation(t->program, "scale");
   t->gl.GenVertexArrays(1, &t->vao);
   return t;
 }
@@ -121,6 +124,8 @@ static void render(void *embed, uint32_t fbo, int width, int height) {
   gl->Disable(GL_SCISSOR_TEST);
   gl->UseProgram(t->program);
   gl->Uniform1f(t->angle_at, t->angle);
+  /* Clip space is the element's shape: squeezed back along its longer side. */
+  gl->Uniform2f(t->scale_at, width > height ? (float)height / width : 1.0f, height > width ? (float)width / height : 1.0f);
   gl->BindVertexArray(t->vao);
   gl->DrawArrays(GL_TRIANGLES, 0, 3);
   t->angle += 0.02f * t->speed;

@@ -601,6 +601,7 @@ impl ApplicationHandler<Event> for App {
         match event {
             WindowEvent::CloseRequested => close(w),
             WindowEvent::Resized(size) => {
+                trace!("window {} resized: {}×{} px", w.id, size.width, size.height);
                 w.surface.resize(&gpu, size.width, size.height);
                 let logical = size.to_logical::<f64>(window.scale_factor());
                 {

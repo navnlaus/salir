@@ -15,12 +15,13 @@ struct U { pull_at: vec2f, pull: f32, dt: f32, size: vec2f, aspect: f32, _pad: f
 @compute @workgroup_size(256) fn step(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= arrayLength(&ps)) { return; }
   var p = ps[id.x];
-  var d = (u.pull_at - p.pos) * vec2f(u.aspect, 1.0);
+  // (In a world as wide as the element is: x from -aspect to aspect, y from -1 to 1; drawn with x / aspect.)
+  let d = u.pull_at * vec2f(u.aspect, 1.0) - p.pos;
   let r2 = dot(d, d) + 0.003;
-  var a = d * (u.pull / (r2 * sqrt(r2))) * 0.05 + vec2f(-p.pos.y, p.pos.x * u.aspect) * 0.15;
-  p.vel = (p.vel + a / vec2f(u.aspect, 1.0) * u.dt) * exp(-0.9 * u.dt);
+  let a = d * (u.pull / (r2 * sqrt(r2))) * 0.05 + vec2f(-p.pos.y, p.pos.x) * 0.15;
+  p.vel = (p.vel + a * u.dt) * exp(-0.9 * u.dt);
   p.pos += p.vel * u.dt;
-  if (abs(p.pos.x) > 1.0) { p.pos.x = clamp(p.pos.x, -1.0, 1.0); p.vel.x *= -0.5; }
+  if (abs(p.pos.x) > u.aspect) { p.pos.x = clamp(p.pos.x, -u.aspect, u.aspect); p.vel.x *= -0.5; }
   if (abs(p.pos.y) > 1.0) { p.pos.y = clamp(p.pos.y, -1.0, 1.0); p.vel.y *= -0.5; }
   ps[id.x] = p;
 }
@@ -30,7 +31,7 @@ struct Out { @builtin(position) pos: vec4f, @location(0) c: vec2f, @location(1) 
   let c = vec2f(f32(v & 1u), f32(v >> 1u)) * 2.0 - 1.0;
   let p = particles[i];
   var o: Out;
-  o.pos = vec4f(p.pos + c * u.size, 0.0, 1.0);
+  o.pos = vec4f(p.pos / vec2f(u.aspect, 1.0) + c * u.size, 0.0, 1.0);
   o.c = c;
   o.colour = mix(vec3f(0.1, 0.3, 1.0), vec3f(1.0, 0.5, 0.15), clamp(length(p.vel) * 0.8, 0.0, 1.0));
   return o;
