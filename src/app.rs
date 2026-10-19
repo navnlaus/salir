@@ -165,6 +165,8 @@ struct Win {
     /// The embed the window's input goes to directly (input="direct"), and whether the pointer's locked.
     capture: Option<(u64, bool)>,
     focused: bool,
+    /// In fullscreen as its page asked (the window's; so it's told when that's left otherwise).
+    fullscreen: bool,
 }
 
 impl Win {
@@ -295,6 +297,7 @@ impl App {
                 closing: false,
                 capture: None,
                 focused: true,
+                fullscreen: false,
             },
         );
         trace!("window {} opened{}: {}", options.id, if options.direct { " (direct)" } else { "" }, options.url);
@@ -351,10 +354,15 @@ impl App {
         let keys: Vec<u64> = self.windows.keys().copied().collect();
         for key in keys {
             let Some(w) = self.windows.get_mut(&key) else { continue };
-            let (messages, title, cursor, popups, painted, closed, error) = {
+            let (messages, title, cursor, popups, painted, closed, error, fullscreen) = {
                 let mut s = w.shared.state.borrow_mut();
-                (std::mem::take(&mut s.messages), s.title.take(), s.cursor.take(), std::mem::take(&mut s.popups), std::mem::replace(&mut s.painted, false), s.closed, s.error.take())
+                (std::mem::take(&mut s.messages), s.title.take(), s.cursor.take(), std::mem::take(&mut s.popups), std::mem::replace(&mut s.painted, false), s.closed, s.error.take(), s.fullscreen.take())
             };
+            // The page in fullscreen (a video's button, F): its window too (a direct one's is Chromium's own).
+            if let (Some(on), Some(window)) = (fullscreen, w.window()) {
+                window.set_fullscreen(on.then_some(winit::window::Fullscreen::Borderless(None)));
+                w.fullscreen = on;
+            }
             if let Some(title) = title.filter(|_| !w.fixed_title) {
                 match w.window() {
                     Some(window) => window.set_title(&title),
@@ -820,6 +828,13 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CloseRequested => close(w),
             WindowEvent::Resized(size) => {
                 trace!("window {} resized: {}×{} px", w.id, size.width, size.height);
+                // Out of fullscreen, not by its page (the window manager's key): the page told.
+                if w.fullscreen && window.fullscreen().is_none() {
+                    w.fullscreen = false;
+                    if let Some(page) = &w.page {
+                        page.exit_fullscreen();
+                    }
+                }
                 if let Some(surface) = &mut w.surface {
                     surface.resize(&gpu, size.width, size.height);
                 }

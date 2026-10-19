@@ -196,6 +196,8 @@ pub struct PageState {
     /// What the page sent (window.salir), not yet seen to.
     pub messages: Vec<Value>,
     pub title: Option<String>,
+    /// The page asked for fullscreen (true) or out of it (false): a video's, the Fullscreen API.
+    pub fullscreen: Option<bool>,
     pub cursor: Option<CursorIcon>,
     /// window.open()'s and target=_blank's addresses (not opened: the app's to).
     pub popups: Vec<String>,
@@ -358,6 +360,10 @@ wrap_display_handler! {
     impl DisplayHandler {
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
             self.shared.state.borrow_mut().title = title.map(|t| t.to_string());
+        }
+
+        fn on_fullscreen_mode_change(&self, _browser: Option<&mut Browser>, fullscreen: ::std::os::raw::c_int) {
+            self.shared.state.borrow_mut().fullscreen = Some(fullscreen != 0);
         }
 
         fn on_cursor_change(&self, _browser: Option<&mut Browser>, _cursor: ::std::os::raw::c_ulong, type_: CursorType, _custom_cursor_info: Option<&CursorInfo>) -> ::std::os::raw::c_int {
@@ -602,6 +608,13 @@ impl Page {
     pub fn set_title(&self, title: &str) {
         if let Some(w) = &self.shared.state.borrow().window {
             w.set_title(Some(&title.into()));
+        }
+    }
+
+    /// The page told its fullscreen is over (its window left it otherwise: the window manager's).
+    pub fn exit_fullscreen(&self) {
+        if let Some(h) = self.host() {
+            h.exit_fullscreen(1);
         }
     }
 
