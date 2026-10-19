@@ -9,7 +9,7 @@ use crate::gpu::{Gpu, Layer, Surface};
 use crate::{keys, Salir, WindowOptions};
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -117,6 +117,8 @@ pub fn run(salir: Salir) -> std::process::ExitCode {
         windows: HashMap::new(),
         next_key: 1,
         quitting: false,
+        dying: VecDeque::new(),
+        turn: 0,
     };
     let _ = event_loop.run_app(&mut app);
     drop(app); // (every page gone before CEF is)
@@ -137,6 +139,11 @@ struct App {
     windows: HashMap<u64, Win>,
     next_key: u64,
     quitting: bool,
+    // Embeds gone from their windows, still to be torn down (an mpv's takes up to 0.4 s): one
+    // a turn of the event loop, from the turn after (a closed window's off the screen first,
+    // the other windows answering in between). With the turn they went.
+    dying: VecDeque<(u64, EmbedLayer)>,
+    turn: u64,
 }
 
 struct Win {
@@ -422,6 +429,7 @@ impl App {
                 if let Some(w) = self.windows.get_mut(&key) {
                     if !w.closing {
                         w.surface = None;
+                        trace!("window {key}: hidden, closing");
                     }
                     close(w);
                 }
@@ -527,12 +535,23 @@ impl App {
         }
     }
 
-    // A window's embeds that `which`, gone (GL's with its context current, its buffers freed).
+    // A window's embeds that `which`, gone: torn down later (bury).
     fn drop_embeds(&mut self, w: &mut Win, which: impl Fn(&EmbedLayer) -> bool) {
-        self.with_gl_current();
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut w.embeds).into_iter().partition(|e| which(e));
         w.embeds = kept;
-        for e in gone {
+        let turn = self.turn;
+        self.dying.extend(gone.into_iter().map(|e| (turn, e)));
+    }
+
+    // One gone embed torn down (GL's with its context current, its buffers freed): one that went
+    // before this turn, or (`all`, quitting) every one.
+    fn bury(&mut self, all: bool) {
+        while let Some((turn, _)) = self.dying.front() {
+            if !all && *turn >= self.turn {
+                return;
+            }
+            let Some((_, e)) = self.dying.pop_front() else { return };
+            self.with_gl_current();
             match e.imp {
                 Imp::Wgpu { embed, .. } => drop(embed),
                 #[cfg(target_os = "linux")]
@@ -544,6 +563,9 @@ impl App {
                         }
                     }
                 }
+            }
+            if !all {
+                return;
             }
         }
     }
@@ -861,6 +883,7 @@ impl ApplicationHandler<Event> for App {
                 let code = keys::windows_key_code(&event.logical_key, event.physical_key);
                 let native = keys::native_key_code(event.physical_key);
                 let down = event.state == ElementState::Pressed;
+                trace!("window {key}: key {:?} {}", event.logical_key, if down { "down" } else { "up" });
                 page.key(down, code, native, f);
                 if !down {
                     return;
@@ -885,6 +908,7 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.turn += 1;
         let now = Instant::now();
         // CEF's work: when it asked for it, and at least every 1/30 s whether it did or not.
         let asked = PUMP_AT.lock().unwrap().is_some_and(|at| at <= now);
@@ -897,9 +921,14 @@ impl ApplicationHandler<Event> for App {
         }
         self.read_pages();
         if self.windows.is_empty() && (!self.control || self.quitting) && self.pending.is_empty() {
+            self.bury(true);
             return event_loop.exit();
         }
-        let next = PUMP_AT.lock().unwrap().unwrap_or(now + interval).min(PUMPED.lock().unwrap().unwrap_or(now) + interval);
+        self.bury(false);
+        let mut next = PUMP_AT.lock().unwrap().unwrap_or(now + interval).min(PUMPED.lock().unwrap().unwrap_or(now) + interval);
+        if !self.dying.is_empty() {
+            next = Instant::now(); // (the next at once, after a look at what's come)
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 }
