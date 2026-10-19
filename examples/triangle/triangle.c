@@ -1,6 +1,7 @@
 /* An example plugin (include/salir.h): a turning triangle, drawn with OpenGL 3.3
  * as libmpv's render API would draw a video, a red bar along its top (to see it's
- * the right way up). The page sets its speed ({"speed": 2}), and is told how many
+ * the right way up). The page sets its speed ({"speed": 2}, or the element's
+ * speed="2"), and is told how many
  * frames it's drawn ({"frames": n}) every second's worth; its input is logged.
  *
  *   cc -O2 -shared -fPIC -Iinclude -o libtriangle.so examples/triangle/triangle.c
@@ -70,6 +71,15 @@ static const char *FS =
     "out vec4 frag;\n"
     "void main() { frag = vec4(colour, 1.0); }\n";
 
+/* A number after `key` in JSON: "speed": 2, or "speed": "2" (an attribute's). */
+static int number(const char *json, const char *key, float *out) {
+  const char *at = strstr(json, key);
+  if (!at || !(at = strchr(at + strlen(key), ':'))) return 0;
+  at += 1 + strspn(at + 1, " \"");
+  *out = (float)atof(at);
+  return 1;
+}
+
 static GLuint shader(struct gl *gl, GLenum type, const char *src) {
   GLuint s = gl->CreateShader(type);
   gl->ShaderSource(s, 1, &src, NULL);
@@ -80,7 +90,8 @@ static GLuint shader(struct gl *gl, GLenum type, const char *src) {
 static void *create(const salir_host *host, const char *options) {
   struct triangle *t = calloc(1, sizeof *t);
   t->host = host;
-  t->speed = strstr(options, "\"speed\"") ? (float)atof(strchr(strstr(options, "\"speed\""), ':') + 1) : 1.0f;
+  t->speed = 1.0f;
+  number(options, "\"speed\"", &t->speed);
 #define LOAD(name) *(void **)&t->gl.name = host->get_proc_address(host->ctx, "gl" #name)
   LOAD(BindFramebuffer); LOAD(Viewport); LOAD(ClearColor); LOAD(Clear); LOAD(Enable); LOAD(Disable);
   LOAD(Scissor); LOAD(CreateShader); LOAD(ShaderSource); LOAD(CompileShader); LOAD(CreateProgram);
@@ -123,9 +134,10 @@ static void render(void *embed, uint32_t fbo, int width, int height) {
 
 static void message(void *embed, const char *json) {
   struct triangle *t = embed;
-  const char *speed = strstr(json, "\"speed\"");
-  if (speed) t->speed = (float)atof(strchr(speed, ':') + 1);
-  else if (strstr(json, "\"input\"")) fprintf(stderr, "triangle: %s\n", json);
+  /* {"speed": 2}, or the element's attribute changed: {"attribute": {"name": "speed", "value": "2"}} */
+  if (strstr(json, "\"attribute\"")) {
+    if (strstr(json, "\"name\":\"speed\"") || strstr(json, "\"name\": \"speed\"")) number(json, "\"value\"", &t->speed);
+  } else if (!number(json, "\"speed\"", &t->speed) && strstr(json, "\"input\"")) fprintf(stderr, "triangle: %s\n", json);
 }
 
 static void destroy(void *embed) {

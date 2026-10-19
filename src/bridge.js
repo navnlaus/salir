@@ -2,11 +2,21 @@
 //
 //   salir.send(message)                    to the app (--control: stdout; a Rust app: on_message)
 //   salir.on(fn)                           from it; returns a function that stops it
-//   salir.embed(element, kind, options)    native content where `element` is, under the page:
-//     -> { send(message), on(fn), remove() }   options.input: the element's input to it too
 //
-// An embed is drawn where the element is, its size, as it moves (followed every
-// frame); the page shows it where it's see-through there. Top frame only.
+// Embeds, native content under the page where an element of it is, its size, as
+// it moves (followed every frame); the page shows it where it's see-through there
+// (the element's children draw over it). Top frame only. As an element:
+//
+//   <salir-embed kind="video" src="…" input></salir-embed>
+//     its size and place: CSS's (display: block unless styled otherwise)
+//     its attributes (but kind, input, id, class, style, tabindex): its options, as strings;
+//       changed later: a message {"attribute": {"name", "value"}} (value null: removed)
+//     kind changed, or the element put elsewhere: made again
+//     input: the element's pointer, wheel and keys to it too
+//     el.send(message); el.addEventListener("message" / "error", (e) => e.detail)
+//
+// or from script: salir.embed(element, kind, options) -> { send(message), on(fn), remove() }
+//   (options.input: as the attribute).
 (() => {
   if (globalThis.salir) return;
   const native = globalThis.__salirSend;
@@ -94,5 +104,56 @@
       }
     },
   });
+
+  if (top && !customElements.get("salir-embed")) {
+    const RESERVED = new Set(["kind", "input", "id", "class", "style", "tabindex"]); // (tabindex: input's, to have the keys)
+    let styled = false;
+    customElements.define("salir-embed", class SalirEmbed extends HTMLElement {
+      #handle = null;
+      #watch = new MutationObserver((changes) => this.#changed(changes));
+
+      connectedCallback() {
+        if (!styled) {
+          // (A block by default; the page's own CSS wins: this sheet comes first.)
+          const sheet = new CSSStyleSheet();
+          sheet.replaceSync("salir-embed { display: block; }");
+          document.adoptedStyleSheets = [sheet, ...document.adoptedStyleSheets];
+          styled = true;
+        }
+        this.#make();
+        this.#watch.observe(this, { attributes: true });
+      }
+
+      disconnectedCallback() {
+        this.#watch.disconnect();
+        this.#handle?.remove();
+        this.#handle = null;
+      }
+
+      send(message) {
+        this.#handle?.send(message);
+      }
+
+      #make() {
+        this.#handle?.remove();
+        this.#handle = null;
+        const kind = this.getAttribute("kind");
+        if (!kind) return;
+        const options = { input: this.hasAttribute("input") };
+        for (const a of this.attributes) if (!RESERVED.has(a.name)) options[a.name] = a.value;
+        this.#handle = salir.embed(this, kind, options);
+        this.#handle.on((m) => this.dispatchEvent(new CustomEvent(m && typeof m === "object" && "error" in m ? "error" : "message", { detail: m })));
+      }
+
+      #changed(changes) {
+        const names = new Set(changes.map((c) => c.attributeName));
+        if (names.has("kind") || names.has("input")) return this.#make();
+        for (const name of names) {
+          if (!RESERVED.has(name)) this.#handle?.send({ attribute: { name, value: this.getAttribute(name) } });
+        }
+      }
+    });
+  }
+
   if (top) post({ $: "hello" }); // (a new page: the last one's embeds are gone)
 })();

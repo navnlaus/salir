@@ -133,7 +133,8 @@ impl Embed for Particles {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut salir = Salir::new("salir-particles").embed("particles", |options, link| {
-        let count = options.get("count").and_then(Value::as_u64).unwrap_or(1 << 18) as u32;
+        // (A number, or a string: <salir-embed count="262144">.)
+        let count = options.get("count").and_then(|c| c.as_u64().or_else(|| c.as_str()?.parse().ok())).unwrap_or(1 << 18) as u32;
         Ok(Box::new(Particles { link, count, pull_at: [0.0, 0.0], pull: 0.0, last: std::time::Instant::now(), gpu: None }) as Box<dyn Embed>)
     });
     let mut page = None;

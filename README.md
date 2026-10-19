@@ -48,25 +48,41 @@ salir --control                              # driven by another program (below)
 Options: `--title`, `--size WxH`, `--app-id ID` (Wayland's, for window rules),
 `--name NAME` (its data: `~/.cache/NAME`).
 
-### In the page: `window.salir`
+### In the page
 
-```js
-salir.send({ any: "JSON" });              // to the app
-salir.on((message) => …);                 // from it
+An embed is an element, sized and placed by CSS like any:
 
-const video = salir.embed(element, "video", { file: "/x.mkv", input: true });
-video.send({ pause: true });              // to the embed
-video.on((message) => …);                 // from it ({error} if it couldn't be made)
-video.remove();
+```html
+<salir-embed kind="video" src="/films/x.mkv" input style="width: 640px; aspect-ratio: 16 / 9">
+  <div class="controls">…</div>   <!-- its children: HTML over the video -->
+</salir-embed>
 ```
 
-An embed is drawn where its element is, its size, following it as the page
-lays out and scrolls; the page shows it where the page is see-through there
-(no background on the element and what's behind it), so the page's controls go
-over it. `input: true`: the element's pointer, wheel and key events are passed
-to it too (`{"input": {"type", "x", "y", "width", "height", "button", "key"…}}`,
-CSS pixels from its top left). The page decides what's on top; salir sends all
-the window's input to the page.
+- `kind`: which embed (an app's, or a plugin's: `--plugin video=…`). Its other
+  attributes (but `input`, `id`, `class`, `style`, `tabindex`) are the embed's
+  options, as strings; one changed later reaches it as
+  `{"attribute": {"name", "value"}}` (value `null`: removed). `kind` changed, or
+  the element moved elsewhere in the page: it's made again.
+- `input`: the element's pointer, wheel and key events go to the embed too
+  (`{"input": {"type", "x", "y", "width", "height", "button", "key"…}}`, CSS
+  pixels from the element's top left).
+- `el.send(message)` to it; `message` events (`e.detail`) from it, `error` if it
+  couldn't be made.
+
+It's drawn under the page where the element is, following it as the page lays
+out and scrolls; the page shows it where the page is see-through there (no
+background on the element, nor behind it), so what the page draws there — the
+element's children — goes over it. It's a rectangle: border-radius and clip-path
+don't cut it (draw the corners over it). salir sends all the window's input to
+the page; the page decides what's on top.
+
+From script, the same: `salir.embed(element, kind, options)` → `{ send, on, remove }`.
+And messages with the app:
+
+```js
+salir.send({ any: "JSON" });              // to the app (--control: stdout)
+salir.on((message) => …);                 // from it
+```
 
 ### Embeds
 
