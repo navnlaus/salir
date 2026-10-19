@@ -2,6 +2,7 @@
 name = "salir"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
 description = "Web pages over native GPU content: windows drawn with wgpu, pages drawn by CEF off screen and handed over as GPU textures"
 publish = false
 

@@ -186,3 +186,7 @@ the network time check and AI Mode's eligibility switched off (features), and
 the component updater's server pointed at a closed local port, for anything that
 asks it anyway (its on-demand installs ignore `--disable-component-update`). In
 a fresh profile, 90 s: no request but those to that port; no socket opened.
+
+## License
+
+Public domain: the Unlicense (`LICENSE`), no rights reserved. CEF, downloaded by `make`, is under its own BSD license.
